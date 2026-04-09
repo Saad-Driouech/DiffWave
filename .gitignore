@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model weights & data
+*.h5
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.hdf5
+
+# TensorBoard logs
+logs/
+runs/
+
+# macOS
+.DS_Store
