@@ -2,6 +2,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import yaml
+import mlflow
 from utils.StationaryEttus import StationaryEttus
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
@@ -14,6 +15,8 @@ with open("/data/beegfs/home/driouech/darcy/IQ_Diffusion/DiffWave/config/config.
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 writer = SummaryWriter(log_dir='/data/beegfs/home/driouech/darcy/IQ_Diffusion/DiffWave/NormalizedData3/logs')
+
+mlflow.set_experiment("DiffWave-RF")
 
 # Model
 #model = UNetSignalCVAE(seq_len=1024, input_channel=16, latent_dim=64, num_conditions=2).to(device)
@@ -102,6 +105,7 @@ def training_epoch(model, dataloader, optimizer, epoch):
 
         writer.add_scalar('Loss/Train_Total_Loss', loss, global_step)
         writer.add_scalar('Training/Gradient_Norm', grad_norm, global_step)
+        mlflow.log_metrics({'train_loss': loss, 'grad_norm': grad_norm}, step=global_step)
         all_t_values.append(t.cpu())
 
         if step % 100 == 0:
@@ -136,23 +140,42 @@ def evaluation_epoch(model, dataloader, epoch):
             #visualize_latent_traversal(writer, model, epoch=epoch, device=device)
             #log_phase_diff(writer, input[:, ::4, :], output[:, ::4, :], epoch=epoch)
             writer.add_scalar('Loss/Eval_Total_Loss', loss.item(), epoch*len(dataloader) + step)
+            mlflow.log_metric('eval_loss', loss.item(), step=epoch*len(dataloader) + step)
         diffusion_localizer.log_all(input, condition, epoch)
         
     return total_loss / len(dataloader)
 
 early_stopping_counter = cfg['early_stopping_patience']
-for i in range(cfg['epochs']):
-    train_loss = training_epoch(model, dataloader_train, optimizer, i)
-    print(f"Epoch {i}, Train_Loss: {train_loss}")
-    eval_loss = evaluation_epoch(model, dataloader_test, epoch=i)
-    print(f"Epoch {i}, Evaluation Loss: {eval_loss}")
-    if train_loss < min_loss:
-        torch.save(model.state_dict(), f'/data/beegfs/home/driouech/darcy/IQ_Diffusion/DiffWave/NormalizedData3/weights_{i}.h5')
-        min_loss = train_loss
-        early_stopping_counter = 0
-    else:
-        early_stopping_counter += 1
-    if early_stopping_counter > 20:
-        print("Early stopping triggered.")
-        break
+with mlflow.start_run():
+    mlflow.log_params({
+        'batch_size': cfg['batch_size'],
+        'learning_rate': cfg['learning_rate'],
+        'epochs': cfg['epochs'],
+        'early_stopping_patience': cfg['early_stopping_patience'],
+        'model': 'DiffWaveRF',
+        'input_channels': 16,
+        'residual_channels': 64,
+        'cond_dim': 2,
+        'timesteps': 1000,
+        'ddim_steps': 50,
+    })
+    for i in range(cfg['epochs']):
+        train_loss = training_epoch(model, dataloader_train, optimizer, i)
+        print(f"Epoch {i}, Train_Loss: {train_loss}")
+        eval_loss = evaluation_epoch(model, dataloader_test, epoch=i)
+        print(f"Epoch {i}, Evaluation Loss: {eval_loss}")
+        mlflow.log_metrics({'epoch_train_loss': train_loss, 'epoch_eval_loss': eval_loss}, step=i)
+        if train_loss < min_loss:
+            weights_path = f'/data/beegfs/home/driouech/darcy/IQ_Diffusion/DiffWave/NormalizedData3/weights_{i}.h5'
+            torch.save(model.state_dict(), weights_path)
+            mlflow.log_artifact(weights_path, artifact_path='checkpoints')
+            min_loss = train_loss
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+        if early_stopping_counter > 20:
+            print("Early stopping triggered.")
+            mlflow.set_tag('stopped_early', True)
+            mlflow.log_metric('stopped_at_epoch', i)
+            break
 
