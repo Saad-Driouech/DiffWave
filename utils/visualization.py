@@ -52,33 +52,34 @@ class DiffusionVisualizer:
         return (batch[:, :8, :].permute(0, 2, 1) + 1j * batch[:, 8:, :].permute(0, 2, 1)).cpu().numpy()
 
     def log_all(self, real_batch, condition, epoch):
-        methods = [
-            lambda: self.log_noise_schedule(epoch),
-            lambda: self.log_denoising_chain(epoch),
-            lambda: self.log_aoa_verification(epoch),
-            lambda: self.log_spectral_fidelity(real_batch, epoch),
-            lambda: self.log_weight_histograms(self.engine.model, epoch),
-            lambda: self.log_multi_antenna_comparison(real_batch, condition, epoch),
-            lambda: self.log_constellation_grid(real_batch, condition, epoch),
-            lambda: self.log_cross_antenna_correlation(real_batch, condition, epoch),
-            lambda: self.log_prediction_error_vs_timestep(real_batch, condition, epoch),
-            lambda: self.log_aoa_sweep(epoch),
-            lambda: self.log_skip_norms(self.engine.model, real_batch, condition, epoch),
-            # ── Additional plots ──────────────────────────────────────────────────
-            lambda: self.log_psd_semilogy(real_batch, condition, epoch),
-            lambda: self.log_spectrogram_comparison(real_batch, condition, epoch),
-            lambda: self.log_time_amplitude_rf(real_batch, condition, epoch),
-            lambda: self.log_iq_time_series_rf(real_batch, condition, epoch),
-            lambda: self.log_iq_constellation_rf(real_batch, condition, epoch),
-            lambda: self.log_degradation_steps(real_batch, epoch),
-            lambda: self.log_stft_spectrogram(real_batch, condition, epoch),
-            lambda: self.log_rf_scalars(real_batch, condition, epoch),
-        ]
-        for fn in methods:
+        print(f"[DiffusionVisualizer] log_all: real_batch={real_batch.shape}, "
+              f"condition={condition.shape}, epoch={epoch}")
+        methods = {
+            'log_noise_schedule':               lambda: self.log_noise_schedule(epoch),
+            'log_denoising_chain':              lambda: self.log_denoising_chain(epoch),
+            'log_aoa_verification':             lambda: self.log_aoa_verification(epoch),
+            'log_spectral_fidelity':            lambda: self.log_spectral_fidelity(real_batch, epoch),
+            'log_weight_histograms':            lambda: self.log_weight_histograms(self.engine.model, epoch),
+            'log_multi_antenna_comparison':     lambda: self.log_multi_antenna_comparison(real_batch, condition, epoch),
+            'log_constellation_grid':           lambda: self.log_constellation_grid(real_batch, condition, epoch),
+            'log_cross_antenna_correlation':    lambda: self.log_cross_antenna_correlation(real_batch, condition, epoch),
+            'log_prediction_error_vs_timestep': lambda: self.log_prediction_error_vs_timestep(real_batch, condition, epoch),
+            'log_aoa_sweep':                    lambda: self.log_aoa_sweep(epoch),
+            'log_skip_norms':                   lambda: self.log_skip_norms(self.engine.model, real_batch, condition, epoch),
+            'log_psd_semilogy':                 lambda: self.log_psd_semilogy(real_batch, condition, epoch),
+            'log_spectrogram_comparison':       lambda: self.log_spectrogram_comparison(real_batch, condition, epoch),
+            'log_time_amplitude_rf':            lambda: self.log_time_amplitude_rf(real_batch, condition, epoch),
+            'log_iq_time_series_rf':            lambda: self.log_iq_time_series_rf(real_batch, condition, epoch),
+            'log_iq_constellation_rf':          lambda: self.log_iq_constellation_rf(real_batch, condition, epoch),
+            'log_degradation_steps':            lambda: self.log_degradation_steps(real_batch, epoch),
+            'log_stft_spectrogram':             lambda: self.log_stft_spectrogram(real_batch, condition, epoch),
+            'log_rf_scalars':                   lambda: self.log_rf_scalars(real_batch, condition, epoch),
+        }
+        for name, fn in methods.items():
             try:
                 fn()
             except Exception as e:
-                print(f"[DiffusionVisualizer] {fn.__name__ if hasattr(fn, '__name__') else 'method'} failed: {e}")
+                print(f"[DiffusionVisualizer] {name} failed: {e}")
 
     # ------------------------------------------------------------------
     # EXISTING METHODS
