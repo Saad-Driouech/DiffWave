@@ -20,7 +20,7 @@ mlflow.set_experiment("DiffWave-RF")
 
 # Model
 #model = UNetSignalCVAE(seq_len=1024, input_channel=16, latent_dim=64, num_conditions=2).to(device)
-model = DiffWaveRF(input_channels=16, residual_channels=64, cond_dim=2).to(device)
+model = DiffWaveRF(input_channels=8, residual_channels=64, cond_dim=2).to(device)
 
 model.train()
 
@@ -153,7 +153,7 @@ with mlflow.start_run():
         'epochs': cfg['epochs'],
         'early_stopping_patience': cfg['early_stopping_patience'],
         'model': 'DiffWaveRF',
-        'input_channels': 16,
+        'input_channels': 8,
         'residual_channels': 64,
         'cond_dim': 2,
         'timesteps': 1000,

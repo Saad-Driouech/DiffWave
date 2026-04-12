@@ -48,8 +48,9 @@ class DiffusionVisualizer:
         self.device = device
 
     def _to_complex(self, batch):
-        """Convert DiffWave (B, 16, 1024) → complex numpy (B, 1024, 8)."""
-        return (batch[:, :8, :].permute(0, 2, 1) + 1j * batch[:, 8:, :].permute(0, 2, 1)).cpu().numpy()
+        """Convert DiffWave (B, 2*n_ant, L) → complex numpy (B, L, n_ant)."""
+        n = batch.shape[1] // 2
+        return (batch[:, :n, :].permute(0, 2, 1) + 1j * batch[:, n:, :].permute(0, 2, 1)).cpu().numpy()
 
     def log_all(self, real_batch, condition, epoch):
         print(f"[DiffusionVisualizer] log_all: real_batch={real_batch.shape}, "
@@ -114,8 +115,9 @@ class DiffusionVisualizer:
 
         gen_data, _ = self.engine.sample_ddim(batch_size, 1024, cond, steps=20)
 
-        ant1 = torch.complex(gen_data[:, 0], gen_data[:, 8])
-        ant2 = torch.complex(gen_data[:, 1], gen_data[:, 9])
+        n_ant = gen_data.shape[1] // 2
+        ant1 = torch.complex(gen_data[:, 0], gen_data[:, n_ant])
+        ant2 = torch.complex(gen_data[:, 1], gen_data[:, n_ant + 1])
         phase_diffs = torch.angle(torch.mean(ant2 * ant1.conj(), dim=1))
 
         fig, ax = plt.subplots()
@@ -133,8 +135,9 @@ class DiffusionVisualizer:
         dummy_cond = torch.zeros(B, 2).to(self.device)
         gen_batch, _ = self.engine.sample_ddim(B, 1024, dummy_cond, steps=50)
 
-        real_c = real_batch[0, 0].cpu().numpy() + 1j * real_batch[0, 8].cpu().numpy()
-        gen_c = gen_batch[0, 0].cpu().numpy() + 1j * gen_batch[0, 8].cpu().numpy()
+        n_ant = real_batch.shape[1] // 2
+        real_c = real_batch[0, 0].cpu().numpy() + 1j * real_batch[0, n_ant].cpu().numpy()
+        gen_c  = gen_batch[0, 0].cpu().numpy() + 1j * gen_batch[0, n_ant].cpu().numpy()
 
         fig, ax = plt.subplots()
         ax.psd(real_c, Fs=1.0, NFFT=512, label='Real')
@@ -185,18 +188,21 @@ class DiffusionVisualizer:
                 self.writer.add_histogram(f'Weights/{name}_bias', layer.bias.detach().cpu(), epoch)
 
     def log_multi_antenna_comparison(self, real_batch, condition, epoch):
-        """8-panel figure: real I-channel vs generated I-channel per antenna."""
+        """Per-antenna figure: real I-channel vs generated I-channel."""
+        n_ant = real_batch.shape[1] // 2
         cond_single = condition[:1].to(self.device)
         self.engine.model.eval()
         with torch.no_grad():
             gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
 
-        fig, axes = plt.subplots(4, 2, figsize=(14, 12))
-        axes = axes.flatten()
+        n_cols = min(n_ant, 4)
+        n_rows = math.ceil(n_ant / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3))
+        axes = np.array(axes).flatten()
         real_np = real_batch[0].cpu().numpy()
         gen_np = gen[0].cpu().numpy()
 
-        for ant in range(8):
+        for ant in range(n_ant):
             ax = axes[ant]
             ax.plot(real_np[ant, :256], label='Real', alpha=0.8, linewidth=0.8)
             ax.plot(gen_np[ant, :256], label='Generated', alpha=0.8, linewidth=0.8, linestyle='--')
@@ -210,7 +216,8 @@ class DiffusionVisualizer:
         plt.close(fig)
 
     def log_constellation_grid(self, real_batch, condition, epoch):
-        """2x4 grid of I/Q constellation plots (real=blue, generated=red) for all 8 antennas."""
+        """I/Q constellation plots (real=blue, generated=red) for all antennas."""
+        n_ant = real_batch.shape[1] // 2
         cond_single = condition[:1].to(self.device)
         self.engine.model.eval()
         with torch.no_grad():
@@ -219,13 +226,15 @@ class DiffusionVisualizer:
         real_np = real_batch[0].cpu().numpy()
         gen_np = gen[0].cpu().numpy()
 
-        fig, axes = plt.subplots(2, 4, figsize=(14, 7))
-        axes = axes.flatten()
+        n_cols = min(n_ant, 4)
+        n_rows = math.ceil(n_ant / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3.5))
+        axes = np.array(axes).flatten()
 
-        for ant in range(8):
+        for ant in range(n_ant):
             ax = axes[ant]
-            ax.scatter(real_np[ant], real_np[ant + 8], alpha=0.3, s=1, c='steelblue', label='Real')
-            ax.scatter(gen_np[ant], gen_np[ant + 8], alpha=0.3, s=1, c='crimson', label='Generated')
+            ax.scatter(real_np[ant], real_np[ant + n_ant], alpha=0.3, s=1, c='steelblue', label='Real')
+            ax.scatter(gen_np[ant], gen_np[ant + n_ant], alpha=0.3, s=1, c='crimson', label='Generated')
             ax.set_title(f"Ant {ant + 1}", fontsize=9)
             ax.set_xlabel("I")
             ax.set_ylabel("Q")
@@ -247,10 +256,12 @@ class DiffusionVisualizer:
         with torch.no_grad():
             gen_batch, _ = self.engine.sample_ddim(B, 1024, cond_b, steps=50)
 
+        n_ant = real_batch.shape[1] // 2
+
         def corr_matrix(batch_np):
             mats = []
             for b in range(batch_np.shape[0]):
-                X = batch_np[b, :8] + 1j * batch_np[b, 8:]   # (8, 1024)
+                X = batch_np[b, :n_ant] + 1j * batch_np[b, n_ant:]
                 R = np.abs(X @ X.conj().T) / X.shape[1]
                 mats.append(R)
             return np.mean(mats, axis=0)
@@ -265,10 +276,10 @@ class DiffusionVisualizer:
             ax.set_title(f"Cross-Antenna Correlation — {title}")
             ax.set_xlabel("Antenna")
             ax.set_ylabel("Antenna")
-            ax.set_xticks(range(8))
-            ax.set_yticks(range(8))
-            ax.set_xticklabels([f"Ant{i+1}" for i in range(8)], rotation=45, fontsize=7)
-            ax.set_yticklabels([f"Ant{i+1}" for i in range(8)], fontsize=7)
+            ax.set_xticks(range(n_ant))
+            ax.set_yticks(range(n_ant))
+            ax.set_xticklabels([f"Ant{i+1}" for i in range(n_ant)], rotation=45, fontsize=7)
+            ax.set_yticklabels([f"Ant{i+1}" for i in range(n_ant)], fontsize=7)
             plt.colorbar(im, ax=ax)
 
         plt.tight_layout()
@@ -335,10 +346,11 @@ class DiffusionVisualizer:
         self.writer.add_figure('Conditioning/AoA_Sweep_TimeDomain', fig, epoch)
         plt.close(fig)
 
+        n_ant = gen_signals[0].shape[0] // 2
         measured_phases = []
         for sig in gen_signals:
-            ant1 = sig[0] + 1j * sig[8]
-            ant2 = sig[1] + 1j * sig[9]
+            ant1 = sig[0] + 1j * sig[n_ant]
+            ant2 = sig[1] + 1j * sig[n_ant + 1]
             phase = np.angle(np.mean(ant2 * ant1.conj()))
             measured_phases.append(phase)
 
@@ -409,12 +421,15 @@ class DiffusionVisualizer:
         with torch.no_grad():
             gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
 
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, 8) complex
-        xh = self._to_complex(gen)[0]               # (1024, 8) complex
+        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant) complex
+        xh = self._to_complex(gen)[0]               # (1024, n_ant) complex
+        n_ant = x0.shape[1]
 
         freqs = np.fft.fftshift(np.fft.fftfreq(1024))
-        fig, axes = plt.subplots(4, 2, figsize=(12, 14))
-        for i, ax in enumerate(axes.flat):
+        n_cols = min(n_ant, 4)
+        n_rows = math.ceil(n_ant / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 3.5))
+        for i, ax in enumerate(np.array(axes).flatten()):
             psd_real = np.abs(np.fft.fftshift(np.fft.fft(x0[:, i]))) ** 2
             psd_pred = np.abs(np.fft.fftshift(np.fft.fft(xh[:, i]))) ** 2
             ax.semilogy(freqs, psd_real, label='Real',      alpha=0.85, lw=1.2)
@@ -438,11 +453,12 @@ class DiffusionVisualizer:
         with torch.no_grad():
             gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
 
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, 8) complex
-        xh = self._to_complex(gen)[0]               # (1024, 8) complex
+        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant) complex
+        xh = self._to_complex(gen)[0]               # (1024, n_ant) complex
+        n_ant = x0.shape[1]
 
-        fig, axes = plt.subplots(8, 2, figsize=(12, 32))
-        for i in range(8):
+        fig, axes = plt.subplots(n_ant, 2, figsize=(12, n_ant * 4))
+        for i in range(n_ant):
             f_ax, t_ax_s, Sxx_real = _gnss_spectrogram_db(x0[:, i])
             _,    _,      Sxx_gen  = _gnss_spectrogram_db(xh[:, i])
             vmin = min(Sxx_real.min(), Sxx_gen.min())
@@ -470,12 +486,15 @@ class DiffusionVisualizer:
         with torch.no_grad():
             gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
 
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, 8)
-        xh = self._to_complex(gen)[0]               # (1024, 8)
+        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant)
+        xh = self._to_complex(gen)[0]               # (1024, n_ant)
+        n_ant = x0.shape[1]
 
-        fig, axes = plt.subplots(4, 2, figsize=(14, 12))
+        n_cols = min(n_ant, 4)
+        n_rows = math.ceil(n_ant / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3))
         t_ax = np.arange(256)
-        for i, ax in enumerate(axes.flat):
+        for i, ax in enumerate(np.array(axes).flatten()):
             ax.plot(t_ax, np.abs(x0[:256, i]), label='Real',      alpha=0.85, lw=1.2)
             ax.plot(t_ax, np.abs(xh[:256, i]), label='Generated', alpha=0.85, lw=1.2, linestyle='--')
             ax.set_title(f'Antenna {i+1}  |IQ|')
@@ -496,12 +515,13 @@ class DiffusionVisualizer:
         with torch.no_grad():
             gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
 
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, 8)
-        xh = self._to_complex(gen)[0]               # (1024, 8)
+        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant)
+        xh = self._to_complex(gen)[0]               # (1024, n_ant)
+        n_ant = x0.shape[1]
 
-        fig, axes = plt.subplots(8, 2, figsize=(14, 24))
+        fig, axes = plt.subplots(n_ant, 2, figsize=(14, n_ant * 3))
         t_iq = np.arange(256)
-        for i in range(8):
+        for i in range(n_ant):
             ax_i, ax_q = axes[i, 0], axes[i, 1]
             # I component
             ax_i.plot(t_iq, x0[:256, i].real, label='Real',      alpha=0.85, lw=1.0)
@@ -533,11 +553,14 @@ class DiffusionVisualizer:
         with torch.no_grad():
             gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
 
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, 8)
-        xh = self._to_complex(gen)[0]               # (1024, 8)
+        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant)
+        xh = self._to_complex(gen)[0]               # (1024, n_ant)
+        n_ant = x0.shape[1]
 
-        fig, axes = plt.subplots(4, 2, figsize=(10, 20))
-        for i, ax in enumerate(axes.flat):
+        n_cols = min(n_ant, 4)
+        n_rows = math.ceil(n_ant / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.5, n_rows * 5))
+        for i, ax in enumerate(np.array(axes).flatten()):
             ax.scatter(x0[:, i].real, x0[:, i].imag, s=1, alpha=0.25, label='Real')
             ax.scatter(xh[:, i].real, xh[:, i].imag, s=1, alpha=0.25, label='Generated')
             ax.set_title(f'IQ Constellation — Antenna {i+1}')
@@ -561,8 +584,8 @@ class DiffusionVisualizer:
             t_s = torch.full((1,), step, dtype=torch.long, device=self.device)
             noise = torch.randn_like(real_batch[:1])
             x_deg, _ = self.engine.add_noise(real_batch[:1].to(self.device), t_s, noise.to(self.device))
-            # Antenna 1: channel 0 (I) + channel 8 (Q) → complex
-            sig_deg = x_deg[0, 0].cpu().numpy() + 1j * x_deg[0, 8].cpu().numpy()  # (1024,)
+            n_ant = x_deg.shape[1] // 2
+            sig_deg = x_deg[0, 0].cpu().numpy() + 1j * x_deg[0, n_ant].cpu().numpy()  # (1024,)
             _, _, Sxx_db = _gnss_spectrogram_db(sig_deg)
             ax.imshow(Sxx_db, aspect='auto', origin='lower', cmap='turbo',
                       interpolation='nearest')
@@ -630,11 +653,11 @@ class DiffusionVisualizer:
             x_T, _ = self.engine.add_noise(x, t_max, noise)
             x_hat = self.engine.model(x_T, t_max, cond)
 
-            # Convert to complex: (B, 1024, 8)
-            x0_c = torch.complex(x[:, :8, :].permute(0, 2, 1),
-                                  x[:, 8:, :].permute(0, 2, 1))   # (B, 1024, 8)
-            xh_c = torch.complex(x_hat[:, :8, :].permute(0, 2, 1),
-                                  x_hat[:, 8:, :].permute(0, 2, 1))
+            n_ant = x.shape[1] // 2
+            x0_c = torch.complex(x[:, :n_ant, :].permute(0, 2, 1),
+                                  x[:, n_ant:, :].permute(0, 2, 1))
+            xh_c = torch.complex(x_hat[:, :n_ant, :].permute(0, 2, 1),
+                                  x_hat[:, n_ant:, :].permute(0, 2, 1))
 
             # Spectral MSE
             fft_real = torch.fft.fft(x0_c, dim=1)
@@ -665,8 +688,8 @@ class DiffusionVisualizer:
                 x_s_hat = self.engine.model(x_s, t_s, cond)
                 step_loss = torch.nn.functional.mse_loss(x_s_hat, x).item()
                 self.writer.add_scalar(f'RF/recon_loss_t{step}', step_loss, epoch)
-                x_s_c = torch.complex(x_s[:, :8, :].permute(0, 2, 1),
-                                      x_s[:, 8:, :].permute(0, 2, 1))
+                x_s_c = torch.complex(x_s[:, :n_ant, :].permute(0, 2, 1),
+                                      x_s[:, n_ant:, :].permute(0, 2, 1))
                 self.writer.add_scalar(f'RF/noisy_amp_t{step}', torch.abs(x_s_c).mean().item(), epoch)
 
 
