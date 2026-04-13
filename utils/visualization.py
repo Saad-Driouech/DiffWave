@@ -9,8 +9,12 @@ import math
 _GNSS_FS = 40.5e6  # GNSS sampling frequency (Hz)
 
 
-def _gnss_spectrogram_db(x, fs=_GNSS_FS, noverlap=64):
-    """Return (f, t, Sxx_dB) using scipy's spectrogram (Blackman window, two-sided PSD)."""
+def _gnss_spectrogram_db(x, fs=_GNSS_FS, noverlap=120):
+    """Return (f, t, Sxx_dB) using scipy's spectrogram (Blackman window, two-sided PSD).
+
+    noverlap=120 out of nperseg=128 gives ~113 time frames for a 1024-sample signal,
+    producing a smooth continuous band instead of the blocky 15-frame appearance.
+    """
     f, t, Sxx = scipy.signal.spectrogram(
         x, fs=fs, nperseg=128, noverlap=noverlap,
         window='blackman', return_onesided=False, detrend=False, mode='psd')
