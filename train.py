@@ -46,12 +46,18 @@ min_loss = float('inf')
 
 
 def _prepare_batch(x, y):
-    """Convert raw complex batch to normalized float I/Q and extract condition."""
+    """Convert raw complex batch to normalized float I/Q and extract condition.
+
+    Per-sample z-score: each sample is normalized independently over all its
+    channels and time steps, avoiding batch-composition effects on scale.
+    """
     x = x.to(device)
     input_real = x.real.to(dtype=torch.float32)
     input_imag = x.imag.to(dtype=torch.float32)
-    inp = torch.cat([input_real, input_imag], dim=1)
-    inp = (inp - inp.mean()) / (inp.std() + 1e-8)
+    inp = torch.cat([input_real, input_imag], dim=1)   # [B, 8, 1024]
+    mean = inp.mean(dim=(1, 2), keepdim=True)           # [B, 1, 1]
+    std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8    # [B, 1, 1]
+    inp  = (inp - mean) / std
     condition = y[1].to(device, dtype=torch.float32)
     return inp, condition
 
