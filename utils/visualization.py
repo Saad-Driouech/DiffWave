@@ -9,12 +9,8 @@ import math
 _GNSS_FS = 40.5e6  # GNSS sampling frequency (Hz)
 
 
-def _gnss_spectrogram_db(x, fs=_GNSS_FS, noverlap=120):
-    """Return (f, t, Sxx_dB) using scipy's spectrogram (Blackman window, two-sided PSD).
-
-    noverlap=120 out of nperseg=128 gives ~113 time frames for a 1024-sample signal,
-    producing a smooth continuous band instead of the blocky 15-frame appearance.
-    """
+def _gnss_spectrogram_db(x, fs=_GNSS_FS, noverlap=64):
+    """Return (f, t, Sxx_dB) using scipy's spectrogram (Blackman window, two-sided PSD)."""
     f, t, Sxx = scipy.signal.spectrogram(
         x, fs=fs, nperseg=128, noverlap=noverlap,
         window='blackman', return_onesided=False, detrend=False, mode='psd')
@@ -50,14 +46,31 @@ class DiffusionVisualizer:
         self.writer = writer
         self.engine = engine
         self.device = device
+        # Load a fixed batch of 4 test samples once at init so every epoch
+        # visualizes the exact same samples (mirrors RF-Diffusion's approach).
+        from UniversalDataLoader import UniversalDataset
+        ds = UniversalDataset(task_id=132, mode='test', angle_mode='sincos')
+        signals, conditions = [], []
+        for i in range(4):
+            x, (_, az, _) = ds[i]
+            signals.append(x)
+            conditions.append(az.float())
+        x = torch.stack(signals)                          # [4, 4, 1024] complex64
+        inp = torch.cat([x.real.float(), x.imag.float()], dim=1)  # [4, 8, 1024]
+        mean = inp.mean(dim=(1, 2), keepdim=True)
+        std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8
+        self.fixed_batch     = ((inp - mean) / std).to(device)
+        self.fixed_condition = torch.stack(conditions).to(device)  # [4, 2]
 
     def _to_complex(self, batch):
         """Convert DiffWave (B, 2*n_ant, L) → complex numpy (B, L, n_ant)."""
         n = batch.shape[1] // 2
         return (batch[:, :n, :].permute(0, 2, 1) + 1j * batch[:, n:, :].permute(0, 2, 1)).cpu().numpy()
 
-    def log_all(self, real_batch, condition, epoch):
-        print(f"[DiffusionVisualizer] log_all: real_batch={real_batch.shape}, "
+    def log_all(self, epoch):
+        real_batch = self.fixed_batch
+        condition  = self.fixed_condition
+        print(f"[DiffusionVisualizer] log_all: fixed_batch={real_batch.shape}, "
               f"condition={condition.shape}, epoch={epoch}")
         methods = {
             'log_noise_schedule':               lambda: self.log_noise_schedule(epoch),

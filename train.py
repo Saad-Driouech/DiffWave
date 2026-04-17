@@ -123,7 +123,7 @@ def evaluation_epoch(model, dataloader, epoch):
             writer.add_scalar('Loss/Eval_Total_Loss', loss.item(), epoch * len(dataloader) + step)
             mlflow.log_metric('eval_loss', loss.item(), step=epoch * len(dataloader) + step)
 
-        diffusion_localizer.log_all(inp, condition, epoch)
+        diffusion_localizer.log_all(epoch)
 
     return total_loss / len(dataloader)
 
