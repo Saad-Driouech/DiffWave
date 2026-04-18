@@ -6,6 +6,7 @@ import yaml
 import mlflow
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+import os
 
 from models.DiffWave import DiffWaveRF, DiffusionEngine
 from utils.visualization import DiffusionVisualizer
@@ -130,6 +131,7 @@ def evaluation_epoch(model, dataloader, epoch):
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 early_stopping_counter = cfg['early_stopping_patience']
+os.makedirs(args.output_dir, exist_ok=True)
 with mlflow.start_run():
     mlflow.log_params({
         'batch_size': cfg['batch_size'],
