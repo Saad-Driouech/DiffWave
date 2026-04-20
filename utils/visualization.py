@@ -42,25 +42,26 @@ def angle_deg_to_cossin(angle):
 
 
 class DiffusionVisualizer:
-    def __init__(self, writer, engine, device):
+    def __init__(self, writer, engine, device, n_eval=16):
         self.writer = writer
         self.engine = engine
         self.device = device
-        # Load a fixed batch of 4 test samples once at init so every epoch
-        # visualizes the exact same samples (mirrors RF-Diffusion's approach).
+        self.n_eval = n_eval
+        # Load n_eval fixed test samples once at init so every epoch visualizes
+        # the exact same samples — enables meaningful epoch-over-epoch comparison.
         from UniversalDataLoader import UniversalDataset
         ds = UniversalDataset(task_id=132, mode='test', angle_mode='sincos')
         signals, conditions = [], []
-        for i in range(4):
+        for i in range(n_eval):
             x, (_, az, _) = ds[i]
             signals.append(x)
             conditions.append(az.float())
-        x = torch.stack(signals)                          # [4, 4, 1024] complex64
-        inp = torch.cat([x.real.float(), x.imag.float()], dim=1)  # [4, 8, 1024]
+        x = torch.stack(signals)                          # [n_eval, 4, 1024] complex64
+        inp = torch.cat([x.real.float(), x.imag.float()], dim=1)  # [n_eval, 8, 1024]
         mean = inp.mean(dim=(1, 2), keepdim=True)
         std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8
         self.fixed_batch     = ((inp - mean) / std).to(device)
-        self.fixed_condition = torch.stack(conditions).to(device)  # [4, 2]
+        self.fixed_condition = torch.stack(conditions).to(device)  # [n_eval, 2]
 
     def _to_complex(self, batch):
         """Convert DiffWave (B, 2*n_ant, L) → complex numpy (B, L, n_ant)."""
@@ -68,30 +69,39 @@ class DiffusionVisualizer:
         return (batch[:, :n, :].permute(0, 2, 1) + 1j * batch[:, n:, :].permute(0, 2, 1)).cpu().numpy()
 
     def log_all(self, epoch):
-        real_batch = self.fixed_batch
-        condition  = self.fixed_condition
+        real_batch = self.fixed_batch     # [N, 8, 1024]
+        condition  = self.fixed_condition # [N, 2]
+        N = real_batch.shape[0]
         print(f"[DiffusionVisualizer] log_all: fixed_batch={real_batch.shape}, "
               f"condition={condition.shape}, epoch={epoch}")
+
+        # Pre-generate all N samples once — reused by every RF and Samples method.
+        self.engine.model.eval()
+        with torch.no_grad():
+            gen_batch, _ = self.engine.sample_ddim(N, 1024, condition, steps=50)
+
         methods = {
             'log_noise_schedule':               lambda: self.log_noise_schedule(epoch),
             'log_denoising_chain':              lambda: self.log_denoising_chain(epoch),
             'log_aoa_verification':             lambda: self.log_aoa_verification(epoch),
-            'log_spectral_fidelity':            lambda: self.log_spectral_fidelity(real_batch, epoch),
+            'log_aoa_regression':               lambda: self.log_aoa_regression(epoch),
+            'log_spectral_fidelity':            lambda: self.log_spectral_fidelity(real_batch, gen_batch, epoch),
             'log_weight_histograms':            lambda: self.log_weight_histograms(self.engine.model, epoch),
-            'log_multi_antenna_comparison':     lambda: self.log_multi_antenna_comparison(real_batch, condition, epoch),
-            'log_constellation_grid':           lambda: self.log_constellation_grid(real_batch, condition, epoch),
+            'log_multi_antenna_comparison':     lambda: self.log_multi_antenna_comparison(real_batch, gen_batch, epoch),
+            'log_constellation_grid':           lambda: self.log_constellation_grid(real_batch, gen_batch, epoch),
             'log_cross_antenna_correlation':    lambda: self.log_cross_antenna_correlation(real_batch, condition, epoch),
             'log_prediction_error_vs_timestep': lambda: self.log_prediction_error_vs_timestep(real_batch, condition, epoch),
             'log_aoa_sweep':                    lambda: self.log_aoa_sweep(epoch),
             'log_skip_norms':                   lambda: self.log_skip_norms(self.engine.model, real_batch, condition, epoch),
-            'log_psd_semilogy':                 lambda: self.log_psd_semilogy(real_batch, condition, epoch),
-            'log_spectrogram_comparison':       lambda: self.log_spectrogram_comparison(real_batch, condition, epoch),
-            'log_time_amplitude_rf':            lambda: self.log_time_amplitude_rf(real_batch, condition, epoch),
-            'log_iq_time_series_rf':            lambda: self.log_iq_time_series_rf(real_batch, condition, epoch),
-            'log_iq_constellation_rf':          lambda: self.log_iq_constellation_rf(real_batch, condition, epoch),
+            'log_psd_semilogy':                 lambda: self.log_psd_semilogy(real_batch, gen_batch, epoch),
+            'log_spectrogram_comparison':       lambda: self.log_spectrogram_comparison(real_batch, gen_batch, epoch),
+            'log_time_amplitude_rf':            lambda: self.log_time_amplitude_rf(real_batch, gen_batch, epoch),
+            'log_iq_time_series_rf':            lambda: self.log_iq_time_series_rf(real_batch, gen_batch, epoch),
+            'log_iq_constellation_rf':          lambda: self.log_iq_constellation_rf(real_batch, gen_batch, epoch),
             'log_degradation_steps':            lambda: self.log_degradation_steps(real_batch, epoch),
-            'log_stft_spectrogram':             lambda: self.log_stft_spectrogram(real_batch, condition, epoch),
+            'log_stft_spectrogram':             lambda: self.log_stft_spectrogram(real_batch, gen_batch, epoch),
             'log_rf_scalars':                   lambda: self.log_rf_scalars(real_batch, condition, epoch),
+            'log_samples_panel':                lambda: self.log_samples_panel(real_batch, gen_batch, epoch),
         }
         for name, fn in methods.items():
             try:
@@ -100,7 +110,7 @@ class DiffusionVisualizer:
                 print(f"[DiffusionVisualizer] {name} failed: {e}")
 
     # ------------------------------------------------------------------
-    # EXISTING METHODS
+    # EXISTING METHODS (no real_batch change)
     # ------------------------------------------------------------------
 
     def log_denoising_chain(self, epoch):
@@ -120,49 +130,6 @@ class DiffusionVisualizer:
             ax.set_ylabel("Amplitude")
             self.writer.add_figure(f'Diffusion/Denoising_Step_{i}', fig, epoch)
             plt.close(fig)
-
-    def log_aoa_verification(self, epoch):
-        """Checks if the model obeys the Angle of Arrival condition."""
-        batch_size = 64
-        cond = torch.zeros(batch_size, 2).to(self.device)
-        cond[:, 0] = np.random.random()
-        cond[:, 1] = np.random.random()
-
-        angle = torch.atan2(cond[:, 0], cond[:, 1])
-
-        gen_data, _ = self.engine.sample_ddim(batch_size, 1024, cond, steps=20)
-
-        n_ant = gen_data.shape[1] // 2
-        ant1 = torch.complex(gen_data[:, 0], gen_data[:, n_ant])
-        ant2 = torch.complex(gen_data[:, 1], gen_data[:, n_ant + 1])
-        phase_diffs = torch.angle(torch.mean(ant2 * ant1.conj(), dim=1))
-
-        fig, ax = plt.subplots()
-        ax.hist(phase_diffs.cpu().numpy(), bins=30, color='orange', alpha=0.7)
-        ax.axvline(x=angle[0].cpu().numpy(), color='r', linestyle='--', label='Target (Approx)')
-        ax.set_title(f"Phase Difference Distribution (Target Cond={angle[0]:.2f} rad)")
-        ax.set_xlabel("Measured Phase Difference (Rad)")
-        ax.legend()
-        self.writer.add_figure('Physics/AoA_Consistency', fig, epoch)
-        plt.close(fig)
-
-    def log_spectral_fidelity(self, real_batch, epoch):
-        """Compares PSD of Real vs Generated."""
-        B = min(real_batch.shape[0], 16)
-        dummy_cond = torch.zeros(B, 2).to(self.device)
-        gen_batch, _ = self.engine.sample_ddim(B, 1024, dummy_cond, steps=50)
-
-        n_ant = real_batch.shape[1] // 2
-        real_c = real_batch[0, 0].cpu().numpy() + 1j * real_batch[0, n_ant].cpu().numpy()
-        gen_c  = gen_batch[0, 0].cpu().numpy() + 1j * gen_batch[0, n_ant].cpu().numpy()
-
-        fig, ax = plt.subplots()
-        ax.psd(real_c, Fs=1.0, NFFT=512, label='Real')
-        ax.psd(gen_c, Fs=1.0, NFFT=512, label='Generated')
-        ax.legend()
-        ax.set_title("Power Spectral Density (Antenna 1)")
-        self.writer.add_figure('Fidelity/PSD', fig, epoch)
-        plt.close(fig)
 
     def log_noise_schedule(self, epoch):
         """Plots the cosine noise schedule and derived SNR curve. Log once at epoch 0."""
@@ -204,67 +171,6 @@ class DiffusionVisualizer:
             if hasattr(layer, 'bias') and layer.bias is not None:
                 self.writer.add_histogram(f'Weights/{name}_bias', layer.bias.detach().cpu(), epoch)
 
-    def log_multi_antenna_comparison(self, real_batch, condition, epoch):
-        """Per-antenna figure: real I-channel vs generated I-channel."""
-        n_ant = real_batch.shape[1] // 2
-        cond_single = condition[:1].to(self.device)
-        self.engine.model.eval()
-        with torch.no_grad():
-            gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
-
-        n_cols = min(n_ant, 4)
-        n_rows = math.ceil(n_ant / n_cols)
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3))
-        axes = np.array(axes).flatten()
-        real_np = real_batch[0].cpu().numpy()
-        gen_np = gen[0].cpu().numpy()
-
-        for ant in range(n_ant):
-            ax = axes[ant]
-            ax.plot(real_np[ant, :256], label='Real', alpha=0.8, linewidth=0.8)
-            ax.plot(gen_np[ant, :256], label='Generated', alpha=0.8, linewidth=0.8, linestyle='--')
-            ax.set_title(f"Antenna {ant + 1} — I channel")
-            ax.set_xlabel("Sample")
-            ax.legend(fontsize=7)
-            ax.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        self.writer.add_figure('Signals/Multi_Antenna_TimeDomain', fig, epoch)
-        plt.close(fig)
-
-    def log_constellation_grid(self, real_batch, condition, epoch):
-        """I/Q constellation plots (real=blue, generated=red) for all antennas."""
-        n_ant = real_batch.shape[1] // 2
-        cond_single = condition[:1].to(self.device)
-        self.engine.model.eval()
-        with torch.no_grad():
-            gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
-
-        real_np = real_batch[0].cpu().numpy()
-        gen_np = gen[0].cpu().numpy()
-
-        n_cols = min(n_ant, 4)
-        n_rows = math.ceil(n_ant / n_cols)
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3.5))
-        axes = np.array(axes).flatten()
-
-        for ant in range(n_ant):
-            ax = axes[ant]
-            ax.scatter(real_np[ant], real_np[ant + n_ant], alpha=0.3, s=1, c='steelblue', label='Real')
-            ax.scatter(gen_np[ant], gen_np[ant + n_ant], alpha=0.3, s=1, c='crimson', label='Generated')
-            ax.set_title(f"Ant {ant + 1}", fontsize=9)
-            ax.set_xlabel("I")
-            ax.set_ylabel("Q")
-            ax.set_aspect('equal', adjustable='datalim')
-            ax.grid(True, alpha=0.3)
-            if ant == 0:
-                ax.legend(fontsize=7, markerscale=5)
-
-        plt.suptitle("Constellation Grid — Real vs Generated", fontsize=12)
-        plt.tight_layout()
-        self.writer.add_figure('Signals/Constellation_Grid', fig, epoch)
-        plt.close(fig)
-
     def log_cross_antenna_correlation(self, real_batch, condition, epoch):
         """Spatial correlation matrix |R| for real and generated signals."""
         B = min(real_batch.shape[0], 16)
@@ -284,7 +190,7 @@ class DiffusionVisualizer:
             return np.mean(mats, axis=0)
 
         R_real = corr_matrix(real_batch[:B].cpu().numpy())
-        R_gen = corr_matrix(gen_batch.cpu().numpy())
+        R_gen  = corr_matrix(gen_batch.cpu().numpy())
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         vmax = max(R_real.max(), R_gen.max())
@@ -412,7 +318,7 @@ class DiffusionVisualizer:
 
         skip_norms.sort(key=lambda v: v[0])
         indices = [v[0] for v in skip_norms]
-        norms = [v[1] for v in skip_norms]
+        norms   = [v[1] for v in skip_norms]
 
         fig, ax = plt.subplots(figsize=(12, 4))
         ax.bar(indices, norms, color='steelblue', alpha=0.8)
@@ -426,161 +332,311 @@ class DiffusionVisualizer:
         plt.close(fig)
 
     # ------------------------------------------------------------------
-    # ADDITIONAL SIGNAL PLOTS
+    # PHYSICS / AoA  (fixed target, new regression plot)
     # ------------------------------------------------------------------
 
-    def log_psd_semilogy(self, real_batch, condition, epoch):
-        """
-        PSD overlay (semilogy) — one subplot per antenna.
-        """
-        cond_single = condition[:1].to(self.device)
+    def log_aoa_verification(self, epoch):
+        """Phase consistency histogram at 5 fixed AoA angles (never random)."""
+        fixed_angles_deg = [-60, -30, 0, 30, 60]
+        n_gen = 32
+
         self.engine.model.eval()
+        fig, axes = plt.subplots(1, len(fixed_angles_deg), figsize=(18, 3.5))
+
         with torch.no_grad():
-            gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
+            for ax, angle_deg in zip(axes, fixed_angles_deg):
+                angle_rad = angle_deg * math.pi / 180.0
+                cond = torch.zeros(n_gen, 2, device=self.device)
+                cond[:, 0] = math.sin(angle_rad)
+                cond[:, 1] = math.cos(angle_rad)
 
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant) complex
-        xh = self._to_complex(gen)[0]               # (1024, n_ant) complex
-        n_ant = x0.shape[1]
+                gen_data, _ = self.engine.sample_ddim(n_gen, 1024, cond, steps=20)
+                n_ant = gen_data.shape[1] // 2
+                ant1 = torch.complex(gen_data[:, 0], gen_data[:, n_ant])
+                ant2 = torch.complex(gen_data[:, 1], gen_data[:, n_ant + 1])
+                phase_diffs = torch.angle(
+                    torch.mean(ant2 * ant1.conj(), dim=1)).cpu().numpy()
 
-        freqs = np.fft.fftshift(np.fft.fftfreq(1024))
+                expected = math.pi * math.sin(angle_rad)  # half-wavelength ULA
+
+                ax.hist(phase_diffs, bins=20, color='orange', alpha=0.7, density=True)
+                ax.axvline(expected, color='r', linestyle='--', linewidth=1.5,
+                           label=f'Expected {expected:.2f} rad')
+                ax.set_title(f'{angle_deg}°', fontsize=10)
+                ax.set_xlabel('Δφ (rad)')
+                ax.legend(fontsize=7)
+                ax.grid(True, alpha=0.3)
+
+        plt.suptitle(f'AoA Phase Consistency (expected = π·sin θ, half-λ ULA) — epoch {epoch}')
+        plt.tight_layout()
+        self.writer.add_figure('Physics/AoA_Consistency', fig, epoch)
+        plt.close(fig)
+
+    def log_aoa_regression(self, epoch):
+        """Scatter/regression: conditioned AoA vs measured Δφ with theoretical reference."""
+        angles_deg = np.linspace(-80, 80, 17)
+        n_gen = 16
+
+        self.engine.model.eval()
+        mean_phases, std_phases = [], []
+
+        with torch.no_grad():
+            for angle_deg in angles_deg:
+                angle_rad = angle_deg * math.pi / 180.0
+                cond = torch.zeros(n_gen, 2, device=self.device)
+                cond[:, 0] = math.sin(angle_rad)
+                cond[:, 1] = math.cos(angle_rad)
+
+                gen_data, _ = self.engine.sample_ddim(n_gen, 1024, cond, steps=20)
+                n_ant = gen_data.shape[1] // 2
+                ant1 = torch.complex(gen_data[:, 0], gen_data[:, n_ant])
+                ant2 = torch.complex(gen_data[:, 1], gen_data[:, n_ant + 1])
+                phases = torch.angle(torch.mean(ant2 * ant1.conj(), dim=1))
+                mean_phases.append(phases.mean().item())
+                std_phases.append(phases.std().item())
+
+        mean_phases  = np.array(mean_phases)
+        std_phases   = np.array(std_phases)
+        theoretical  = np.pi * np.sin(np.deg2rad(angles_deg))
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.errorbar(angles_deg, mean_phases, yerr=std_phases, fmt='o-',
+                    capsize=4, linewidth=1.5, label='Measured (mean ± std)', color='steelblue')
+        ax.plot(angles_deg, theoretical, 'r--', linewidth=1.5,
+                label='Theoretical (π·sin θ, half-λ ULA)')
+        ax.set_xlabel('Conditioned AoA (°)')
+        ax.set_ylabel('Measured Δφ (rad)')
+        ax.set_title(f'AoA Conditioning Regression — epoch {epoch}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self.writer.add_figure('Physics/AoA_Regression', fig, epoch)
+        plt.close(fig)
+
+    # ------------------------------------------------------------------
+    # RF PANEL  (aggregate: mean / mean±std over all N fixed samples)
+    # ------------------------------------------------------------------
+
+    def log_spectral_fidelity(self, real_batch, gen_batch, epoch):
+        """PSD overlay for all N samples, antenna 1."""
+        N = real_batch.shape[0]
+        x_all = self._to_complex(real_batch)  # (N, 1024, n_ant)
+        g_all = self._to_complex(gen_batch)
+
+        fig, ax = plt.subplots()
+        for b in range(N):
+            ax.psd(x_all[b, :, 0], Fs=1.0, NFFT=512,
+                   color='steelblue', alpha=0.4, label='Real' if b == 0 else '')
+            ax.psd(g_all[b, :, 0], Fs=1.0, NFFT=512,
+                   color='crimson', alpha=0.4, linestyle='--', label='Generated' if b == 0 else '')
+        ax.legend()
+        ax.set_title(f"Power Spectral Density — Antenna 1 (N={N})")
+        self.writer.add_figure('Fidelity/PSD', fig, epoch)
+        plt.close(fig)
+
+    def log_multi_antenna_comparison(self, real_batch, gen_batch, epoch):
+        """Per-antenna figure: real I-channel vs generated I-channel (sample 0)."""
+        n_ant = real_batch.shape[1] // 2
+        real_np = real_batch[0].cpu().numpy()
+        gen_np  = gen_batch[0].cpu().numpy()
+
+        n_cols = min(n_ant, 4)
+        n_rows = math.ceil(n_ant / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3))
+        axes = np.array(axes).flatten()
+
+        for ant in range(n_ant):
+            ax = axes[ant]
+            ax.plot(real_np[ant, :256], label='Real',      alpha=0.8, linewidth=0.8)
+            ax.plot(gen_np[ant,  :256], label='Generated', alpha=0.8, linewidth=0.8, linestyle='--')
+            ax.set_title(f"Antenna {ant + 1} — I channel")
+            ax.set_xlabel("Sample")
+            ax.legend(fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        self.writer.add_figure('Signals/Multi_Antenna_TimeDomain', fig, epoch)
+        plt.close(fig)
+
+    def log_constellation_grid(self, real_batch, gen_batch, epoch):
+        """I/Q constellation plots (real=blue, generated=red) for all antennas (sample 0)."""
+        n_ant = real_batch.shape[1] // 2
+        real_np = real_batch[0].cpu().numpy()
+        gen_np  = gen_batch[0].cpu().numpy()
+
+        n_cols = min(n_ant, 4)
+        n_rows = math.ceil(n_ant / n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3.5))
+        axes = np.array(axes).flatten()
+
+        for ant in range(n_ant):
+            ax = axes[ant]
+            ax.scatter(real_np[ant], real_np[ant + n_ant], alpha=0.3, s=1, c='steelblue', label='Real')
+            ax.scatter(gen_np[ant],  gen_np[ant + n_ant],  alpha=0.3, s=1, c='crimson',   label='Generated')
+            ax.set_title(f"Ant {ant + 1}", fontsize=9)
+            ax.set_xlabel("I")
+            ax.set_ylabel("Q")
+            ax.set_aspect('equal', adjustable='datalim')
+            ax.grid(True, alpha=0.3)
+            if ant == 0:
+                ax.legend(fontsize=7, markerscale=5)
+
+        plt.suptitle("Constellation Grid — Real vs Generated", fontsize=12)
+        plt.tight_layout()
+        self.writer.add_figure('Signals/Constellation_Grid', fig, epoch)
+        plt.close(fig)
+
+    def log_psd_semilogy(self, real_batch, gen_batch, epoch):
+        """PSD — mean ± std over all N samples, per antenna."""
+        N = real_batch.shape[0]
+        x_all = self._to_complex(real_batch)  # (N, 1024, n_ant)
+        g_all = self._to_complex(gen_batch)
+        n_ant = x_all.shape[2]
+
+        freqs  = np.fft.fftshift(np.fft.fftfreq(1024))
         n_cols = min(n_ant, 4)
         n_rows = math.ceil(n_ant / n_cols)
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 3.5))
         for i, ax in enumerate(np.array(axes).flatten()):
-            psd_real = np.abs(np.fft.fftshift(np.fft.fft(x0[:, i]))) ** 2
-            psd_pred = np.abs(np.fft.fftshift(np.fft.fft(xh[:, i]))) ** 2
-            ax.semilogy(freqs, psd_real, label='Real',      alpha=0.85, lw=1.2)
-            ax.semilogy(freqs, psd_pred, label='Generated', alpha=0.85, lw=1.2, linestyle='--')
+            psds_r = np.array([np.abs(np.fft.fftshift(np.fft.fft(x_all[b, :, i])))**2 for b in range(N)])
+            psds_g = np.array([np.abs(np.fft.fftshift(np.fft.fft(g_all[b, :, i])))**2 for b in range(N)])
+
+            r_mean = psds_r.mean(0); r_std = psds_r.std(0)
+            g_mean = psds_g.mean(0); g_std = psds_g.std(0)
+
+            ax.semilogy(freqs, r_mean, label='Real',      alpha=0.9, lw=1.2, color='steelblue')
+            ax.fill_between(freqs,
+                            np.maximum(r_mean - r_std, 1e-20),
+                            r_mean + r_std, alpha=0.2, color='steelblue')
+            ax.semilogy(freqs, g_mean, label='Generated', alpha=0.9, lw=1.2,
+                        linestyle='--', color='crimson')
+            ax.fill_between(freqs,
+                            np.maximum(g_mean - g_std, 1e-20),
+                            g_mean + g_std, alpha=0.2, color='crimson')
             ax.set_title(f'Antenna {i+1} PSD')
             ax.set_xlabel('Normalised Frequency')
             ax.set_ylabel('Power')
             ax.legend(fontsize=7)
             ax.grid(True, which='both', linestyle='--', linewidth=0.4)
-        plt.suptitle(f'Power Spectral Density — epoch {epoch}')
+        plt.suptitle(f'PSD (mean ± std, N={N}) — epoch {epoch}')
         plt.tight_layout()
         self.writer.add_figure('RF/psd_per_antenna', fig, epoch)
         plt.close(fig)
 
-    def log_spectrogram_comparison(self, real_batch, condition, epoch):
-        """
-        Spectrogram comparison — all 8 antennas (8×2 grid, Real | Generated).
-        """
-        cond_single = condition[:1].to(self.device)
-        self.engine.model.eval()
-        with torch.no_grad():
-            gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
-
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant) complex
-        xh = self._to_complex(gen)[0]               # (1024, n_ant) complex
-        n_ant = x0.shape[1]
+    def log_spectrogram_comparison(self, real_batch, gen_batch, epoch):
+        """Spectrogram — mean over all N samples, per antenna (n_ant × 2 grid)."""
+        N = real_batch.shape[0]
+        x_all = self._to_complex(real_batch)  # (N, 1024, n_ant)
+        g_all = self._to_complex(gen_batch)
+        n_ant = x_all.shape[2]
 
         fig, axes = plt.subplots(n_ant, 2, figsize=(12, n_ant * 4))
         for i in range(n_ant):
-            f_ax, t_ax_s, Sxx_real = _gnss_spectrogram_db(x0[:, i])
-            _,    _,      Sxx_gen  = _gnss_spectrogram_db(xh[:, i])
+            Sxx_reals, Sxx_gens = [], []
+            for b in range(N):
+                f_ax, t_ax_s, S = _gnss_spectrogram_db(x_all[b, :, i])
+                Sxx_reals.append(S)
+                _, _, S = _gnss_spectrogram_db(g_all[b, :, i])
+                Sxx_gens.append(S)
+            Sxx_real = np.mean(Sxx_reals, axis=0)
+            Sxx_gen  = np.mean(Sxx_gens,  axis=0)
             vmin = min(Sxx_real.min(), Sxx_gen.min())
             vmax = max(Sxx_real.max(), Sxx_gen.max())
             extent = [t_ax_s[0] * 1e3, t_ax_s[-1] * 1e3, f_ax[0], f_ax[-1]]
             for ax, Sxx, title in zip(axes[i], [Sxx_real, Sxx_gen], ['Real', 'Generated']):
                 im = ax.imshow(Sxx, aspect='auto', origin='lower', cmap='turbo',
-                               vmin=vmin, vmax=vmax, extent=extent,
-                               interpolation='nearest')
-                ax.set_title(f'Antenna {i+1} — {title}')
+                               vmin=vmin, vmax=vmax, extent=extent, interpolation='nearest')
+                ax.set_title(f'Antenna {i+1} — {title} (mean, N={N})')
                 ax.set_xlabel('t [ms]')
                 ax.set_ylabel('f [Hz]')
                 fig.colorbar(im, ax=ax, format='%+.0f dB-Hz')
-        plt.suptitle(f'Spectrogram — epoch {epoch}')
+        plt.suptitle(f'Spectrogram (averaged over {N} samples) — epoch {epoch}')
         plt.tight_layout()
         self.writer.add_figure('RF/spectrogram', fig, epoch)
         plt.close(fig)
 
-    def log_time_amplitude_rf(self, real_batch, condition, epoch):
-        """
-        Time-domain amplitude |IQ| — first 256 samples per antenna (4×2 grid).
-        """
-        cond_single = condition[:1].to(self.device)
-        self.engine.model.eval()
-        with torch.no_grad():
-            gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
+    def log_time_amplitude_rf(self, real_batch, gen_batch, epoch):
+        """Time-domain amplitude |IQ| — mean ± std over all N samples."""
+        N = real_batch.shape[0]
+        x_all = self._to_complex(real_batch)
+        g_all = self._to_complex(gen_batch)
+        n_ant = x_all.shape[2]
 
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant)
-        xh = self._to_complex(gen)[0]               # (1024, n_ant)
-        n_ant = x0.shape[1]
-
+        t_ax   = np.arange(256)
         n_cols = min(n_ant, 4)
         n_rows = math.ceil(n_ant / n_cols)
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3))
-        t_ax = np.arange(256)
         for i, ax in enumerate(np.array(axes).flatten()):
-            ax.plot(t_ax, np.abs(x0[:256, i]), label='Real',      alpha=0.85, lw=1.2)
-            ax.plot(t_ax, np.abs(xh[:256, i]), label='Generated', alpha=0.85, lw=1.2, linestyle='--')
-            ax.set_title(f'Antenna {i+1}  |IQ|')
+            amps_r = np.array([np.abs(x_all[b, :256, i]) for b in range(N)])
+            amps_g = np.array([np.abs(g_all[b, :256, i]) for b in range(N)])
+            r_mean = amps_r.mean(0); r_std = amps_r.std(0)
+            g_mean = amps_g.mean(0); g_std = amps_g.std(0)
+            ax.plot(t_ax, r_mean, label='Real',      alpha=0.85, lw=1.2, color='steelblue')
+            ax.fill_between(t_ax, r_mean - r_std, r_mean + r_std, alpha=0.2, color='steelblue')
+            ax.plot(t_ax, g_mean, label='Generated', alpha=0.85, lw=1.2,
+                    linestyle='--', color='crimson')
+            ax.fill_between(t_ax, g_mean - g_std, g_mean + g_std, alpha=0.2, color='crimson')
+            ax.set_title(f'Antenna {i+1}  |IQ| (mean ± std)')
             ax.set_xlabel('Sample')
             ax.legend(fontsize=7)
             ax.grid(True, linestyle='--', linewidth=0.4)
-        plt.suptitle(f'Time-domain Amplitude (first 256 samples) — epoch {epoch}')
+        plt.suptitle(f'Time-domain Amplitude — first 256 samples (N={N}) — epoch {epoch}')
         plt.tight_layout()
         self.writer.add_figure('RF/time_amplitude', fig, epoch)
         plt.close(fig)
 
-    def log_iq_time_series_rf(self, real_batch, condition, epoch):
-        """
-        I(t) and Q(t) per antenna — 8 rows × 2 cols (I | Q), first 256 samples.
-        """
-        cond_single = condition[:1].to(self.device)
-        self.engine.model.eval()
-        with torch.no_grad():
-            gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
-
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant)
-        xh = self._to_complex(gen)[0]               # (1024, n_ant)
-        n_ant = x0.shape[1]
+    def log_iq_time_series_rf(self, real_batch, gen_batch, epoch):
+        """I(t) and Q(t) — mean ± std over all N samples, per antenna."""
+        N = real_batch.shape[0]
+        x_all = self._to_complex(real_batch)
+        g_all = self._to_complex(gen_batch)
+        n_ant = x_all.shape[2]
+        t_iq  = np.arange(256)
 
         fig, axes = plt.subplots(n_ant, 2, figsize=(14, n_ant * 3))
-        t_iq = np.arange(256)
         for i in range(n_ant):
-            ax_i, ax_q = axes[i, 0], axes[i, 1]
-            # I component
-            ax_i.plot(t_iq, x0[:256, i].real, label='Real',      alpha=0.85, lw=1.0)
-            ax_i.plot(t_iq, xh[:256, i].real, label='Generated', alpha=0.85, lw=1.0, linestyle='--')
-            ax_i.set_title(f'Antenna {i+1} — I(t)')
-            ax_i.set_xlabel('Sample')
-            ax_i.set_ylabel('I')
-            ax_i.legend(fontsize=7)
-            ax_i.grid(True, linestyle='--', linewidth=0.4)
-            # Q component
-            ax_q.plot(t_iq, x0[:256, i].imag, label='Real',      alpha=0.85, lw=1.0)
-            ax_q.plot(t_iq, xh[:256, i].imag, label='Generated', alpha=0.85, lw=1.0, linestyle='--')
-            ax_q.set_title(f'Antenna {i+1} — Q(t)')
-            ax_q.set_xlabel('Sample')
-            ax_q.set_ylabel('Q')
-            ax_q.legend(fontsize=7)
-            ax_q.grid(True, linestyle='--', linewidth=0.4)
-        plt.suptitle(f'IQ Time Series (first 256 samples) — epoch {epoch}')
+            I_r = np.array([x_all[b, :256, i].real for b in range(N)])
+            Q_r = np.array([x_all[b, :256, i].imag for b in range(N)])
+            I_g = np.array([g_all[b, :256, i].real for b in range(N)])
+            Q_g = np.array([g_all[b, :256, i].imag for b in range(N)])
+            for ax, R, G, label in zip(
+                [axes[i, 0], axes[i, 1]], [I_r, Q_r], [I_g, Q_g], ['I(t)', 'Q(t)']
+            ):
+                r_mean = R.mean(0); r_std = R.std(0)
+                g_mean = G.mean(0); g_std = G.std(0)
+                ax.plot(t_iq, r_mean, label='Real',      lw=1.0, alpha=0.85, color='steelblue')
+                ax.fill_between(t_iq, r_mean - r_std, r_mean + r_std, alpha=0.2, color='steelblue')
+                ax.plot(t_iq, g_mean, label='Generated', lw=1.0, alpha=0.85,
+                        linestyle='--', color='crimson')
+                ax.fill_between(t_iq, g_mean - g_std, g_mean + g_std, alpha=0.2, color='crimson')
+                ax.set_title(f'Antenna {i+1} — {label} (mean ± std)')
+                ax.set_xlabel('Sample')
+                ax.legend(fontsize=7)
+                ax.grid(True, linestyle='--', linewidth=0.4)
+        plt.suptitle(f'IQ Time Series (first 256 samples, N={N}) — epoch {epoch}')
         plt.tight_layout()
         self.writer.add_figure('RF/iq_time_series', fig, epoch)
         plt.close(fig)
 
-    def log_iq_constellation_rf(self, real_batch, condition, epoch):
-        """
-        IQ Constellation scatter — all 8 antennas (4×2 grid).
-        """
-        cond_single = condition[:1].to(self.device)
-        self.engine.model.eval()
-        with torch.no_grad():
-            gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
-
-        x0 = self._to_complex(real_batch[:1])[0]   # (1024, n_ant)
-        xh = self._to_complex(gen)[0]               # (1024, n_ant)
-        n_ant = x0.shape[1]
+    def log_iq_constellation_rf(self, real_batch, gen_batch, epoch):
+        """IQ Constellation — all N samples overlaid per antenna."""
+        N = real_batch.shape[0]
+        x_all = self._to_complex(real_batch)
+        g_all = self._to_complex(gen_batch)
+        n_ant = x_all.shape[2]
 
         n_cols = min(n_ant, 4)
         n_rows = math.ceil(n_ant / n_cols)
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.5, n_rows * 5))
         for i, ax in enumerate(np.array(axes).flatten()):
-            ax.scatter(x0[:, i].real, x0[:, i].imag, s=1, alpha=0.25, label='Real')
-            ax.scatter(xh[:, i].real, xh[:, i].imag, s=1, alpha=0.25, label='Generated')
-            ax.set_title(f'IQ Constellation — Antenna {i+1}')
+            for b in range(N):
+                ax.scatter(x_all[b, :, i].real, x_all[b, :, i].imag,
+                           s=1, alpha=max(0.1, 0.5 / N),
+                           color='steelblue', label='Real'      if b == 0 else '')
+                ax.scatter(g_all[b, :, i].real, g_all[b, :, i].imag,
+                           s=1, alpha=max(0.1, 0.5 / N),
+                           color='crimson',   label='Generated' if b == 0 else '')
+            ax.set_title(f'IQ Constellation — Antenna {i+1} (N={N})')
             ax.set_xlabel('I')
             ax.set_ylabel('Q')
             ax.legend(fontsize=7, markerscale=6)
@@ -592,61 +648,59 @@ class DiffusionVisualizer:
         plt.close(fig)
 
     def log_degradation_steps(self, real_batch, epoch):
-        """
-        Forward degradation spectrogram — Antenna 1, 5 timesteps (t=0,25,50,75,99).
-        """
+        """Forward degradation spectrogram — Antenna 1, 5 timesteps (mean over N samples)."""
+        N = real_batch.shape[0]
         steps_to_show = [0, 25, 50, 75, 99]
         fig, axes = plt.subplots(1, 5, figsize=(20, 4))
         for ax, step in zip(axes, steps_to_show):
-            t_s = torch.full((1,), step, dtype=torch.long, device=self.device)
-            noise = torch.randn_like(real_batch[:1])
-            x_deg, _ = self.engine.add_noise(real_batch[:1].to(self.device), t_s, noise.to(self.device))
+            t_s   = torch.full((N,), step, dtype=torch.long, device=self.device)
+            noise = torch.randn_like(real_batch)
+            x_deg, _ = self.engine.add_noise(real_batch.to(self.device), t_s, noise.to(self.device))
             n_ant = x_deg.shape[1] // 2
-            sig_deg = x_deg[0, 0].cpu().numpy() + 1j * x_deg[0, n_ant].cpu().numpy()  # (1024,)
-            _, _, Sxx_db = _gnss_spectrogram_db(sig_deg)
-            ax.imshow(Sxx_db, aspect='auto', origin='lower', cmap='turbo',
+            Sxx_list = []
+            for b in range(N):
+                sig = x_deg[b, 0].cpu().numpy() + 1j * x_deg[b, n_ant].cpu().numpy()
+                _, _, Sxx = _gnss_spectrogram_db(sig)
+                Sxx_list.append(Sxx)
+            mean_Sxx = np.mean(Sxx_list, axis=0)
+            ax.imshow(mean_Sxx, aspect='auto', origin='lower', cmap='turbo',
                       interpolation='nearest')
             ax.set_title(f't = {step}')
             ax.set_xlabel('t [ms]')
             ax.set_ylabel('f [Hz]' if step == 0 else '')
-        plt.suptitle(f'Forward Degradation — Antenna 1 — epoch {epoch}')
+        plt.suptitle(f'Forward Degradation — Antenna 1 (mean, N={N}) — epoch {epoch}')
         plt.tight_layout()
         self.writer.add_figure('RF/degradation_steps', fig, epoch)
         plt.close(fig)
 
-    def log_stft_spectrogram(self, real_batch, condition, epoch):
-        """
-        STFT spectrogram (dB) — Real vs Generated, Antenna 1.
-        STFT spectrogram logged to TensorBoard.
-        """
-        cond_single = condition[:1].to(self.device)
-        self.engine.model.eval()
-        with torch.no_grad():
-            gen, _ = self.engine.sample_ddim(1, 1024, cond_single, steps=50)
-
-        # Antenna 1 I-channel, shape (512,) — use first 512 samples to match save_wifi
-        data_sig = real_batch[0, 0, :512].cpu()
-        pred_sig = gen[0, 0, :512].cpu()
-
+    def log_stft_spectrogram(self, real_batch, gen_batch, epoch):
+        """STFT spectrogram — mean over all N samples, Antenna 1."""
+        N = real_batch.shape[0]
         n_fft = 24
         hop_length = 17
-        data_spec = torch.stft(data_sig, n_fft=n_fft, hop_length=hop_length, return_complex=True)
-        pred_spec = torch.stft(pred_sig, n_fft=n_fft, hop_length=hop_length, return_complex=True)
 
-        data_spec_mag = torch.abs(data_spec)
-        pred_spec_mag = torch.abs(pred_spec)
-        data_spec_dB = 20 * np.log10(data_spec_mag.numpy() + 1e-6)
-        pred_spec_dB = 20 * np.log10(pred_spec_mag.numpy() + 1e-6)
+        specs_real, specs_gen = [], []
+        for b in range(N):
+            data_sig = real_batch[b, 0, :512].cpu()
+            pred_sig = gen_batch[b,  0, :512].cpu()
+            specs_real.append(
+                torch.abs(torch.stft(data_sig, n_fft=n_fft, hop_length=hop_length,
+                                     return_complex=True)).numpy())
+            specs_gen.append(
+                torch.abs(torch.stft(pred_sig, n_fft=n_fft, hop_length=hop_length,
+                                     return_complex=True)).numpy())
+
+        mean_real_db = 20 * np.log10(np.mean(specs_real, axis=0) + 1e-6)
+        mean_gen_db  = 20 * np.log10(np.mean(specs_gen,  axis=0) + 1e-6)
 
         fig = plt.figure(figsize=(6, 3))
         ax1 = plt.subplot(1, 2, 1)
-        im1 = ax1.matshow(data_spec_dB, cmap='viridis', origin='lower')
-        ax1.set_title('Data Spectrogram (dB)')
+        im1 = ax1.matshow(mean_real_db, cmap='viridis', origin='lower')
+        ax1.set_title(f'Data STFT (mean, N={N})')
         plt.colorbar(im1, format='%+2.0f dB', ax=ax1, orientation='horizontal', pad=0.05)
-
         ax2 = plt.subplot(1, 2, 2)
-        im2 = ax2.matshow(pred_spec_dB, cmap='viridis', origin='lower')
-        ax2.set_title('Prediction Spectrogram (dB)')
+        im2 = ax2.matshow(mean_gen_db, cmap='viridis', origin='lower')
+        ax2.set_title(f'Generated STFT (mean, N={N})')
         plt.colorbar(im2, format='%+2.0f dB', ax=ax2, orientation='horizontal', pad=0.05)
 
         plt.suptitle(f'STFT Spectrogram — Antenna 1 — epoch {epoch}')
@@ -655,12 +709,9 @@ class DiffusionVisualizer:
         plt.close(fig)
 
     def log_rf_scalars(self, real_batch, condition, epoch):
-        """
-        Scalar metrics: freq_mse, snr_db, amp_ratio, cond_norm.
-        Uses a single model forward at t_max (full noise) for speed.
-        """
+        """Scalar metrics: freq_mse, snr_db, amp_ratio, cond_norm."""
         B = min(real_batch.shape[0], 8)
-        x = real_batch[:B].to(self.device)
+        x    = real_batch[:B].to(self.device)
         cond = condition[:B].to(self.device)
 
         self.engine.model.eval()
@@ -668,46 +719,109 @@ class DiffusionVisualizer:
             t_max = torch.full((B,), self.engine.timesteps - 1, dtype=torch.long, device=self.device)
             noise = torch.randn_like(x)
             x_T, _ = self.engine.add_noise(x, t_max, noise)
-            x_hat = self.engine.model(x_T, t_max, cond)
+            x_hat  = self.engine.model(x_T, t_max, cond)
 
             n_ant = x.shape[1] // 2
-            x0_c = torch.complex(x[:, :n_ant, :].permute(0, 2, 1),
-                                  x[:, n_ant:, :].permute(0, 2, 1))
-            xh_c = torch.complex(x_hat[:, :n_ant, :].permute(0, 2, 1),
-                                  x_hat[:, n_ant:, :].permute(0, 2, 1))
+            x0_c  = torch.complex(x[:, :n_ant,    :].permute(0, 2, 1),
+                                   x[:, n_ant:,    :].permute(0, 2, 1))
+            xh_c  = torch.complex(x_hat[:, :n_ant, :].permute(0, 2, 1),
+                                   x_hat[:, n_ant:, :].permute(0, 2, 1))
 
-            # Spectral MSE
             fft_real = torch.fft.fft(x0_c, dim=1)
             fft_pred = torch.fft.fft(xh_c, dim=1)
             freq_mse = torch.mean(torch.abs(fft_real - fft_pred) ** 2).item()
             self.writer.add_scalar('RF/freq_mse', freq_mse, epoch)
 
-            # Reconstruction SNR (dB)
             sig_pwr   = torch.mean(torch.abs(x0_c) ** 2).item()
             noise_pwr = torch.mean(torch.abs(x0_c - xh_c) ** 2).item() + 1e-12
             self.writer.add_scalar('RF/snr_db', 10 * np.log10(sig_pwr / noise_pwr), epoch)
 
-            # Output amplitude vs target amplitude — zero-collapse detector
             output_amp = torch.abs(xh_c).mean().item()
             target_amp = torch.abs(x0_c).mean().item()
-            self.writer.add_scalar('RF/output_amp',  output_amp, epoch)
-            self.writer.add_scalar('RF/target_amp',  target_amp, epoch)
-            self.writer.add_scalar('RF/amp_ratio',   output_amp / (target_amp + 1e-12), epoch)
+            self.writer.add_scalar('RF/output_amp', output_amp, epoch)
+            self.writer.add_scalar('RF/target_amp', target_amp, epoch)
+            self.writer.add_scalar('RF/amp_ratio',  output_amp / (target_amp + 1e-12), epoch)
+            self.writer.add_scalar('RF/cond_norm',  cond.norm(dim=-1).mean().item(), epoch)
 
-            # Condition vector norm — verify conditioning is active
-            self.writer.add_scalar('RF/cond_norm', cond.norm(dim=-1).mean().item(), epoch)
-
-            # Per-step reconstruction loss at t=0,25,50,75,99
             for step in [0, 25, 50, 75, 99]:
-                t_s = torch.full((B,), step, dtype=torch.long, device=self.device)
+                t_s     = torch.full((B,), step, dtype=torch.long, device=self.device)
                 noise_s = torch.randn_like(x)
-                x_s, _ = self.engine.add_noise(x, t_s, noise_s)
+                x_s, _  = self.engine.add_noise(x, t_s, noise_s)
                 x_s_hat = self.engine.model(x_s, t_s, cond)
                 step_loss = torch.nn.functional.mse_loss(x_s_hat, x).item()
                 self.writer.add_scalar(f'RF/recon_loss_t{step}', step_loss, epoch)
                 x_s_c = torch.complex(x_s[:, :n_ant, :].permute(0, 2, 1),
                                       x_s[:, n_ant:, :].permute(0, 2, 1))
                 self.writer.add_scalar(f'RF/noisy_amp_t{step}', torch.abs(x_s_c).mean().item(), epoch)
+
+    # ------------------------------------------------------------------
+    # SAMPLES PANEL  (per-sample figures under Samples/)
+    # ------------------------------------------------------------------
+
+    def log_samples_panel(self, real_batch, gen_batch, epoch):
+        """Per-sample spectrogram, PSD, and IQ constellation under the Samples/ panel."""
+        N = real_batch.shape[0]
+        x_all = self._to_complex(real_batch)  # (N, 1024, n_ant)
+        g_all = self._to_complex(gen_batch)
+        n_ant = x_all.shape[2]
+        freqs = np.fft.fftshift(np.fft.fftfreq(1024))
+
+        for b in range(N):
+            # --- Spectrogram ---
+            fig, axes = plt.subplots(n_ant, 2, figsize=(12, n_ant * 4))
+            for i in range(n_ant):
+                f_ax, t_ax_s, Sxx_real = _gnss_spectrogram_db(x_all[b, :, i])
+                _, _, Sxx_gen = _gnss_spectrogram_db(g_all[b, :, i])
+                vmin = min(Sxx_real.min(), Sxx_gen.min())
+                vmax = max(Sxx_real.max(), Sxx_gen.max())
+                extent = [t_ax_s[0] * 1e3, t_ax_s[-1] * 1e3, f_ax[0], f_ax[-1]]
+                for ax, Sxx, title in zip(axes[i], [Sxx_real, Sxx_gen], ['Real', 'Generated']):
+                    im = ax.imshow(Sxx, aspect='auto', origin='lower', cmap='turbo',
+                                   vmin=vmin, vmax=vmax, extent=extent, interpolation='nearest')
+                    ax.set_title(f'Antenna {i+1} — {title}')
+                    ax.set_xlabel('t [ms]')
+                    ax.set_ylabel('f [Hz]')
+                    fig.colorbar(im, ax=ax, format='%+.0f dB-Hz')
+            plt.suptitle(f'Sample {b} — Spectrogram — epoch {epoch}')
+            plt.tight_layout()
+            self.writer.add_figure(f'Samples/spectrogram/sample_{b}', fig, epoch)
+            plt.close(fig)
+
+            # --- PSD ---
+            n_cols = min(n_ant, 4)
+            n_rows = math.ceil(n_ant / n_cols)
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3, n_rows * 3.5))
+            for i, ax in enumerate(np.array(axes).flatten()):
+                psd_r = np.abs(np.fft.fftshift(np.fft.fft(x_all[b, :, i])))**2
+                psd_g = np.abs(np.fft.fftshift(np.fft.fft(g_all[b, :, i])))**2
+                ax.semilogy(freqs, psd_r, label='Real',      alpha=0.85, lw=1.2)
+                ax.semilogy(freqs, psd_g, label='Generated', alpha=0.85, lw=1.2, linestyle='--')
+                ax.set_title(f'Antenna {i+1} PSD')
+                ax.set_xlabel('Normalised Frequency')
+                ax.legend(fontsize=7)
+                ax.grid(True, which='both', linestyle='--', linewidth=0.4)
+            plt.suptitle(f'Sample {b} — PSD — epoch {epoch}')
+            plt.tight_layout()
+            self.writer.add_figure(f'Samples/psd/sample_{b}', fig, epoch)
+            plt.close(fig)
+
+            # --- IQ Constellation ---
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 2.5, n_rows * 5))
+            for i, ax in enumerate(np.array(axes).flatten()):
+                ax.scatter(x_all[b, :, i].real, x_all[b, :, i].imag,
+                           s=1, alpha=0.25, label='Real')
+                ax.scatter(g_all[b, :, i].real, g_all[b, :, i].imag,
+                           s=1, alpha=0.25, label='Generated')
+                ax.set_title(f'IQ — Ant {i+1}')
+                ax.set_xlabel('I')
+                ax.set_ylabel('Q')
+                ax.legend(fontsize=7, markerscale=6)
+                ax.set_aspect('equal')
+                ax.grid(True, linestyle='--', linewidth=0.4)
+            plt.suptitle(f'Sample {b} — IQ Constellation — epoch {epoch}')
+            plt.tight_layout()
+            self.writer.add_figure(f'Samples/iq_constellation/sample_{b}', fig, epoch)
+            plt.close(fig)
 
 
 # ------------------------------------------------------------------
@@ -761,40 +875,3 @@ def log_visualizations(writer, model, test_loader, epoch, device):
         ax[0].scatter(real_I, real_Q, alpha=0.5, s=1)
         ax[0].set_title("Real Constellation")
         ax[0].grid(True)
-
-        gen_I = recon[0, 0, :].cpu().numpy()
-        gen_Q = recon[0, 1, :].cpu().numpy()
-        ax[1].scatter(gen_I, gen_Q, alpha=0.5, s=1, c='r')
-        ax[1].set_title("Generated Constellation")
-        ax[1].grid(True)
-
-        writer.add_figure('Visuals/Constellation', fig_const, epoch)
-
-        fig_psd, ax_psd = plt.subplots(figsize=(10, 5))
-        ax_psd.psd(real_I + 1j * real_Q, NFFT=512, Fs=1.0, label='Real')
-        ax_psd.psd(gen_I + 1j * gen_Q, NFFT=512, Fs=1.0, label='Generated', color='r', alpha=0.7)
-        ax_psd.legend()
-        ax_psd.set_title("Power Spectral Density")
-
-        writer.add_figure('Visuals/PSD', fig_psd, epoch)
-        plt.close('all')
-
-
-def log_phase_diff(writer, real, recon, epoch):
-    real_ant1 = torch.complex(real[:, 0, :], real[:, 2, :])
-    real_ant2 = torch.complex(real[:, 1, :], real[:, 3, :])
-
-    recon_ant1 = torch.complex(recon[:, 0, :], recon[:, 2, :])
-    recon_ant2 = torch.complex(recon[:, 1, :], recon[:, 3, :])
-
-    real_diff = torch.angle(real_ant2 * real_ant1.conj())
-    recon_diff = torch.angle(recon_ant2 * recon_ant1.conj())
-
-    fig, ax = plt.subplots()
-    ax.hist(real_diff.flatten().cpu().numpy(), bins=50, alpha=0.5, label='Real')
-    ax.hist(recon_diff.flatten().cpu().numpy(), bins=50, alpha=0.5, color='r', label='Gen')
-    ax.legend()
-    ax.set_title("Phase Difference Distribution (Ant1 vs Ant2)")
-
-    writer.add_figure('Visuals/PhaseDiff', fig, epoch)
-    plt.close(fig)

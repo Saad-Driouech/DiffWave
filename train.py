@@ -86,13 +86,23 @@ def train_step(x, labels):
 
 def training_epoch(model, dataloader, optimizer, epoch):
     all_t_values = []
+    total_loss   = 0.0
+    max_grad     = 0.0
+    ema_loss     = None
+    ema_alpha    = 0.98
+
     for step, (x, y) in tqdm(enumerate(dataloader), total=len(dataloader)):
         inp, condition = _prepare_batch(x, y)
 
         loss, grad_norm, per_channel_loss, t = train_step(inp, condition)
         global_step = epoch * len(dataloader) + step
 
-        writer.add_scalar('Loss/Train_Total_Loss', loss, global_step)
+        total_loss += loss
+        max_grad    = max(max_grad, grad_norm)
+        ema_loss    = loss if ema_loss is None else ema_alpha * ema_loss + (1 - ema_alpha) * loss
+
+        writer.add_scalar('Loss/Train_Step',     loss,     global_step)
+        writer.add_scalar('Loss/Train_Step_EMA', ema_loss, global_step)
         writer.add_scalar('Training/Gradient_Norm', grad_norm, global_step)
         mlflow.log_metrics({'train_loss': loss, 'grad_norm': grad_norm}, step=global_step)
         all_t_values.append(t.cpu())
@@ -102,8 +112,19 @@ def training_epoch(model, dataloader, optimizer, epoch):
             for ch in range(per_channel_loss.shape[0]):
                 writer.add_scalar(f'Training/PerChannel_Loss_ch{ch}', per_channel_loss[ch].item(), global_step)
 
+    avg_loss = total_loss / len(dataloader)
+
+    # Per-epoch summaries
+    writer.add_scalar('Training/Max_Grad_Norm_Epoch', max_grad, epoch)
     writer.add_histogram('Training/Timestep_Distribution', torch.cat(all_t_values).float(), epoch)
-    return loss
+
+    # Per-layer gradient norm histogram (gradients still live from last backward)
+    grad_norms = [p.grad.norm().item()
+                  for p in model.parameters() if p.grad is not None]
+    if grad_norms:
+        writer.add_histogram('Training/Per_Layer_Grad_Norms', torch.tensor(grad_norms), epoch)
+
+    return avg_loss
 
 
 def evaluation_epoch(model, dataloader, epoch):
@@ -121,7 +142,7 @@ def evaluation_epoch(model, dataloader, epoch):
             loss = F.mse_loss(noise_pred, noise)
             total_loss += loss.item()
 
-            writer.add_scalar('Loss/Eval_Total_Loss', loss.item(), epoch * len(dataloader) + step)
+            writer.add_scalar('Loss/Eval_Step', loss.item(), epoch * len(dataloader) + step)
             mlflow.log_metric('eval_loss', loss.item(), step=epoch * len(dataloader) + step)
 
         diffusion_localizer.log_all(epoch)
@@ -150,8 +171,10 @@ with mlflow.start_run():
     })
     for i in range(cfg['epochs']):
         train_loss = training_epoch(model, dataloader_train, optimizer, i)
+        writer.add_scalar('Loss/Epoch_Train', train_loss, i)
         print(f"Epoch {i}, Train_Loss: {train_loss}")
         eval_loss = evaluation_epoch(model, dataloader_test, epoch=i)
+        writer.add_scalar('Loss/Epoch_Eval', eval_loss, i)
         print(f"Epoch {i}, Evaluation Loss: {eval_loss}")
         mlflow.log_metrics({'epoch_train_loss': train_loss, 'epoch_eval_loss': eval_loss}, step=i)
 
