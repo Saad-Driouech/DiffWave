@@ -132,6 +132,7 @@ class DiffusionVisualizer:
             'log_denoising_chain':              lambda: self.log_denoising_chain(epoch),
             'log_aoa_verification':             lambda: self.log_aoa_verification(epoch),
             'log_aoa_regression':               lambda: self.log_aoa_regression(epoch),
+            'log_aoa_phase_emergence':          lambda: self.log_aoa_phase_emergence(epoch),
             'log_spectral_fidelity':            lambda: self.log_spectral_fidelity(real_batch, gen_batch, epoch),
             'log_weight_histograms':            lambda: self.log_weight_histograms(self.engine.model, epoch),
             'log_multi_antenna_comparison':     lambda: self.log_multi_antenna_comparison(real_batch, gen_batch, epoch),
@@ -433,6 +434,78 @@ class DiffusionVisualizer:
         plt.tight_layout()
         self.writer.add_figure('Physics/AoA_Consistency', fig, epoch)
         plt.close(fig)
+
+    def log_aoa_phase_emergence(self, epoch):
+        """For several denoising timesteps t, build AoA-Consistency-style
+        histograms of inter-antenna Δφ measured on the partially-denoised
+        sample x_t. Reveals at which point in the reverse diffusion process
+        the model commits to the correct phase relationship.
+
+        One figure per snapshot t, logged under Physics/AoA_Emergence/tNNNN.
+        """
+        fixed_angles_deg = [-150, -75, 0, 75, 150]
+        n_gen = 32
+        ddim_steps = 50
+        target_ts = [999, 800, 600, 400, 200, 0]
+
+        T = self.engine.timesteps
+        # DDIM linspace timesteps, descending (start of each reverse step):
+        ddim_t_schedule = np.linspace(0, T - 1, ddim_steps).astype(int)[::-1]
+
+        ant_x, ant_y, fc, el_ref_deg, _, _ = _aoa_geometry()
+        el_ref_rad = np.deg2rad(el_ref_deg)
+
+        # Generate per-angle and capture all intermediates.
+        self.engine.model.eval()
+        intermediates = {}
+        with torch.no_grad():
+            for angle_deg in fixed_angles_deg:
+                angle_rad = angle_deg * math.pi / 180.0
+                cond = torch.zeros(n_gen, 2, device=self.device)
+                cond[:, 0] = math.sin(angle_rad)
+                cond[:, 1] = math.cos(angle_rad)
+                _, sigs = self.engine.sample_ddim(
+                    n_gen, 1024, cond, steps=ddim_steps)
+                intermediates[angle_deg] = sigs
+
+        # Build one figure per snapshot timestep.
+        for target_t in target_ts:
+            idx = int(np.argmin(np.abs(ddim_t_schedule - target_t)))
+            idx = min(idx, len(intermediates[fixed_angles_deg[0]]) - 1)
+            actual_t = int(ddim_t_schedule[idx])
+
+            fig, axes = plt.subplots(1, len(fixed_angles_deg), figsize=(18, 3.5))
+            for ax, angle_deg in zip(axes, fixed_angles_deg):
+                x_t = intermediates[angle_deg][idx]
+                if not torch.is_tensor(x_t):
+                    x_t = torch.as_tensor(x_t)
+                n_ant = x_t.shape[1] // 2
+                ant1 = torch.complex(x_t[:, 0], x_t[:, n_ant])
+                ant2 = torch.complex(x_t[:, 1], x_t[:, n_ant + 1])
+                phase_diffs = torch.angle(
+                    torch.mean(ant2 * ant1.conj(), dim=1)).cpu().numpy()
+
+                angle_rad = angle_deg * math.pi / 180.0
+                expected = float(_dphi_baseline(
+                    (0, 1), angle_rad, el_ref_rad, ant_x, ant_y, fc))
+
+                ax.hist(phase_diffs, bins=24, range=(-np.pi, np.pi),
+                        color='orange', alpha=0.7, density=True)
+                ax.axvline(expected, color='r', linestyle='--', linewidth=1.5,
+                           label=f'Expected {expected:.2f} rad')
+                ax.set_title(f'{angle_deg}°', fontsize=10)
+                ax.set_xlabel('Δφ (rad)')
+                ax.set_xlim(-np.pi, np.pi)
+                ax.legend(fontsize=7)
+                ax.grid(True, alpha=0.3)
+
+            plt.suptitle(
+                f'AoA Phase Emergence — t≈{actual_t} '
+                f'(DDIM step {idx + 1}/{ddim_steps}) — epoch {epoch}')
+            plt.tight_layout()
+            self.writer.add_figure(
+                f'Physics/AoA_Emergence/t{actual_t:04d}', fig, epoch)
+            plt.close(fig)
 
     def log_aoa_regression(self, epoch):
         """Conditioned AoA vs measured Δφ for baseline (0,1), with theoretical
