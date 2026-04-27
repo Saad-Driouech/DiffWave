@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import matplotlib
@@ -7,6 +8,52 @@ import scipy.signal
 import math
 
 _GNSS_FS = 40.5e6  # GNSS sampling frequency (Hz)
+_C_LIGHT = 299_792_458.0
+
+
+def _env_floats(name, n, default):
+    raw = os.environ.get(name)
+    if not raw:
+        return list(default)
+    try:
+        vals = [float(x) for x in raw.split(',')]
+    except ValueError:
+        print(f"[visualization] could not parse {name}; using defaults")
+        return list(default)
+    if len(vals) != n:
+        print(f"[visualization] {name} expected {n} values, got {len(vals)}; using defaults")
+        return list(default)
+    return vals
+
+
+def _aoa_geometry():
+    """Antenna geometry / carrier / elevation reference for AoA plots.
+
+    Set on the cluster via environment variables; defaults are zeros so
+    no real values are committed to git:
+        DIFFWAVE_ANT_X="x0,x1,x2,x3"        # metres
+        DIFFWAVE_ANT_Y="y0,y1,y2,y3"
+        DIFFWAVE_FC_HZ="1.575e9"
+        DIFFWAVE_EL_REF_DEG="-30"           # central reference elevation
+        DIFFWAVE_EL_RANGE_DEG="-67,-1"      # min,max for shaded band
+    """
+    ant_x = _env_floats('DIFFWAVE_ANT_X', 4, [0.0, 0.0, 0.0, 0.0])
+    ant_y = _env_floats('DIFFWAVE_ANT_Y', 4, [0.0, 0.0, 0.0, 0.0])
+    fc    = float(os.environ.get('DIFFWAVE_FC_HZ', '1.575e9'))
+    el_ref = float(os.environ.get('DIFFWAVE_EL_REF_DEG', '0'))
+    el_min, el_max = _env_floats('DIFFWAVE_EL_RANGE_DEG', 2, [0.0, 0.0])
+    return np.array(ant_x), np.array(ant_y), fc, el_ref, el_min, el_max
+
+
+def _dphi_baseline(pair, angles_rad, el_rad, ant_x, ant_y, fc_hz):
+    """Theoretical Δφ between antennas pair=(i, j) for far-field source
+    at (azimuth, elevation). Sign convention matches the dataset's, as
+    verified empirically by tests/aoa_geometry_test.py (slope −1 vs
+    physics-textbook k·r convention)."""
+    i, j = pair
+    dx, dy = ant_x[j] - ant_x[i], ant_y[j] - ant_y[i]
+    k_mag = 2 * np.pi / (_C_LIGHT / fc_hz)
+    return -k_mag * np.cos(el_rad) * (dx * np.cos(angles_rad) + dy * np.sin(angles_rad))
 
 
 def _gnss_spectrogram_db(x, fs=_GNSS_FS, noverlap=64):
@@ -239,8 +286,9 @@ class DiffusionVisualizer:
         plt.close(fig)
 
     def log_aoa_sweep(self, epoch):
-        """Generates signals at 6 evenly-spaced AoA angles and shows time-domain and phase."""
-        angles_deg = np.linspace(-90, 90, 6)
+        """Generates signals at 6 AoA angles spanning the dataset's full
+        azimuth range, and compares measured Δφ to the planar geometry."""
+        angles_deg = np.linspace(-150, 150, 6)
         angles_rad = angles_deg * math.pi / 180.0
 
         conds = torch.tensor(
@@ -277,8 +325,15 @@ class DiffusionVisualizer:
             phase = np.angle(np.mean(ant2 * ant1.conj()))
             measured_phases.append(phase)
 
+        ant_x, ant_y, fc, el_ref_deg, _, _ = _aoa_geometry()
+        theory = _dphi_baseline(
+            (0, 1), angles_rad, np.deg2rad(el_ref_deg), ant_x, ant_y, fc)
+
         fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(angles_deg, np.array(measured_phases), marker='o', label='Measured phase diff (ant1→ant2)')
+        ax.plot(angles_deg, np.array(measured_phases), marker='o',
+                label='Measured (ant1→ant2)')
+        ax.plot(angles_deg, theory, 'r--',
+                label=f'Theory el={el_ref_deg:.0f}° (2×2 planar)')
         ax.set_title("Inter-Antenna Phase Difference vs AoA Condition")
         ax.set_xlabel("Conditioned AoA (degrees)")
         ax.set_ylabel("Measured Phase Diff (rad)")
@@ -336,9 +391,13 @@ class DiffusionVisualizer:
     # ------------------------------------------------------------------
 
     def log_aoa_verification(self, epoch):
-        """Phase consistency histogram at 5 fixed AoA angles (never random)."""
-        fixed_angles_deg = [-60, -30, 0, 30, 60]
+        """Phase consistency histogram for baseline (0,1) at fixed AoA angles
+        spanning the dataset's full azimuth range. Theoretical reference uses
+        the actual 2×2 planar geometry at a representative elevation."""
+        fixed_angles_deg = [-150, -75, 0, 75, 150]
         n_gen = 32
+        ant_x, ant_y, fc, el_ref_deg, _, _ = _aoa_geometry()
+        el_ref_rad = np.deg2rad(el_ref_deg)
 
         self.engine.model.eval()
         fig, axes = plt.subplots(1, len(fixed_angles_deg), figsize=(18, 3.5))
@@ -357,7 +416,8 @@ class DiffusionVisualizer:
                 phase_diffs = torch.angle(
                     torch.mean(ant2 * ant1.conj(), dim=1)).cpu().numpy()
 
-                expected = math.pi * math.sin(angle_rad)  # half-wavelength ULA
+                expected = float(_dphi_baseline(
+                    (0, 1), angle_rad, el_ref_rad, ant_x, ant_y, fc))
 
                 ax.hist(phase_diffs, bins=20, color='orange', alpha=0.7, density=True)
                 ax.axvline(expected, color='r', linestyle='--', linewidth=1.5,
@@ -367,15 +427,21 @@ class DiffusionVisualizer:
                 ax.legend(fontsize=7)
                 ax.grid(True, alpha=0.3)
 
-        plt.suptitle(f'AoA Phase Consistency (expected = π·sin θ, half-λ ULA) — epoch {epoch}')
+        plt.suptitle(
+            f'AoA Phase Consistency — baseline (0,1), 2×2 planar array, '
+            f'el_ref={el_ref_deg:.0f}° — epoch {epoch}')
         plt.tight_layout()
         self.writer.add_figure('Physics/AoA_Consistency', fig, epoch)
         plt.close(fig)
 
     def log_aoa_regression(self, epoch):
-        """Scatter/regression: conditioned AoA vs measured Δφ with theoretical reference."""
-        angles_deg = np.linspace(-80, 80, 17)
+        """Conditioned AoA vs measured Δφ for baseline (0,1), with theoretical
+        reference computed from the actual 2×2 planar geometry at the
+        dataset's mean elevation, plus a shaded band over the dataset's
+        elevation range."""
+        angles_deg = np.linspace(-180, 180, 37)
         n_gen = 16
+        ant_x, ant_y, fc, el_ref_deg, el_min_deg, el_max_deg = _aoa_geometry()
 
         self.engine.model.eval()
         mean_phases, std_phases = [], []
@@ -395,19 +461,31 @@ class DiffusionVisualizer:
                 mean_phases.append(phases.mean().item())
                 std_phases.append(phases.std().item())
 
-        mean_phases  = np.array(mean_phases)
-        std_phases   = np.array(std_phases)
-        theoretical  = np.pi * np.sin(np.deg2rad(angles_deg))
+        mean_phases = np.array(mean_phases)
+        std_phases  = np.array(std_phases)
+        ang_rad     = np.deg2rad(angles_deg)
+        theoretical = _dphi_baseline(
+            (0, 1), ang_rad, np.deg2rad(el_ref_deg), ant_x, ant_y, fc)
+        theory_min  = _dphi_baseline(
+            (0, 1), ang_rad, np.deg2rad(el_min_deg), ant_x, ant_y, fc)
+        theory_max  = _dphi_baseline(
+            (0, 1), ang_rad, np.deg2rad(el_max_deg), ant_x, ant_y, fc)
+        band_lo = np.minimum(theory_min, theory_max)
+        band_hi = np.maximum(theory_min, theory_max)
 
-        fig, ax = plt.subplots(figsize=(9, 5))
-        ax.errorbar(angles_deg, mean_phases, yerr=std_phases, fmt='o-',
-                    capsize=4, linewidth=1.5, label='Measured (mean ± std)', color='steelblue')
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.fill_between(angles_deg, band_lo, band_hi, color='red', alpha=0.15,
+                        label=f'Theory band  el ∈ [{el_min_deg:.0f}, {el_max_deg:.0f}]°')
         ax.plot(angles_deg, theoretical, 'r--', linewidth=1.5,
-                label='Theoretical (π·sin θ, half-λ ULA)')
+                label=f'Theory  el={el_ref_deg:.0f}° (2×2 planar)')
+        ax.errorbar(angles_deg, mean_phases, yerr=std_phases, fmt='o-',
+                    capsize=3, linewidth=1.2, markersize=4,
+                    label='Measured (mean ± std)', color='steelblue')
         ax.set_xlabel('Conditioned AoA (°)')
-        ax.set_ylabel('Measured Δφ (rad)')
+        ax.set_ylabel('Measured Δφ — baseline (0,1) (rad)')
         ax.set_title(f'AoA Conditioning Regression — epoch {epoch}')
-        ax.legend()
+        ax.set_xlim(-180, 180)
+        ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
         self.writer.add_figure('Physics/AoA_Regression', fig, epoch)
