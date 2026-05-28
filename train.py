@@ -28,7 +28,7 @@ writer = SummaryWriter(log_dir=args.log_dir)
 mlflow.set_experiment(args.experiment)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-model = DiffWaveRF(input_channels=8, residual_channels=64, cond_dim=2).to(device)
+model = DiffWaveRF(input_channels=8, residual_channels=64, cond_dim=4).to(device)
 model.train()
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────
@@ -59,7 +59,9 @@ def _prepare_batch(x, y):
     mean = inp.mean(dim=(1, 2), keepdim=True)           # [B, 1, 1]
     std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8    # [B, 1, 1]
     inp  = (inp - mean) / std
-    condition = y[1].to(device, dtype=torch.float32)
+    az = y[1].to(device, dtype=torch.float32)
+    el = y[2].to(device, dtype=torch.float32)
+    condition = torch.cat([az, el], dim=1)   # [B, 4]
     return inp, condition
 
 
@@ -162,7 +164,7 @@ with mlflow.start_run():
         'model': 'DiffWaveRF',
         'input_channels': 8,
         'residual_channels': 64,
-        'cond_dim': 2,
+        'cond_dim': 4,
         'timesteps': 1000,
         'ddim_steps': 50,
         'experiment': args.experiment,

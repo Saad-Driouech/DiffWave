@@ -100,15 +100,15 @@ class DiffusionVisualizer:
         ds = UniversalDataset(task_id=132, mode='test', angle_mode='sincos')
         signals, conditions = [], []
         for i in range(n_eval):
-            x, (_, az, _) = ds[i]
+            x, (_, az, el) = ds[i]
             signals.append(x)
-            conditions.append(az.float())
+            conditions.append(torch.cat([az.float(), el.float()]))  # [4]
         x = torch.stack(signals)                          # [n_eval, 4, 1024] complex64
         inp = torch.cat([x.real.float(), x.imag.float()], dim=1)  # [n_eval, 8, 1024]
         mean = inp.mean(dim=(1, 2), keepdim=True)
         std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8
         self.fixed_batch     = ((inp - mean) / std).to(device)
-        self.fixed_condition = torch.stack(conditions).to(device)  # [n_eval, 2]
+        self.fixed_condition = torch.stack(conditions).to(device)  # [n_eval, 4]
 
     def _to_complex(self, batch):
         """Convert DiffWave (B, 2*n_ant, L) → complex numpy (B, L, n_ant)."""
@@ -163,7 +163,7 @@ class DiffusionVisualizer:
 
     def log_denoising_chain(self, epoch):
         """Visualizes the reverse process: Noise -> Signal"""
-        cond = torch.zeros(1, 2).to(self.device)
+        cond = torch.zeros(1, 4).to(self.device)
         self.engine.model.eval()
         with torch.no_grad():
             _, sigs = self.engine.sample_ddim(1, 1024, cond, steps=50)
@@ -292,8 +292,11 @@ class DiffusionVisualizer:
         angles_deg = np.linspace(-150, 150, 6)
         angles_rad = angles_deg * math.pi / 180.0
 
+        _, _, _, el_ref_deg, _, _ = _aoa_geometry()
+        el_ref_rad = np.deg2rad(el_ref_deg)
         conds = torch.tensor(
-            [[math.sin(a), math.cos(a)] for a in angles_rad],
+            [[math.sin(a), math.cos(a), math.sin(el_ref_rad), math.cos(el_ref_rad)]
+             for a in angles_rad],
             dtype=torch.float32, device=self.device
         )
 
@@ -406,9 +409,11 @@ class DiffusionVisualizer:
         with torch.no_grad():
             for ax, angle_deg in zip(axes, fixed_angles_deg):
                 angle_rad = angle_deg * math.pi / 180.0
-                cond = torch.zeros(n_gen, 2, device=self.device)
+                cond = torch.zeros(n_gen, 4, device=self.device)
                 cond[:, 0] = math.sin(angle_rad)
                 cond[:, 1] = math.cos(angle_rad)
+                cond[:, 2] = math.sin(el_ref_rad)
+                cond[:, 3] = math.cos(el_ref_rad)
 
                 gen_data, _ = self.engine.sample_ddim(n_gen, 1024, cond, steps=20)
                 n_ant = gen_data.shape[1] // 2
@@ -461,9 +466,11 @@ class DiffusionVisualizer:
         with torch.no_grad():
             for angle_deg in fixed_angles_deg:
                 angle_rad = angle_deg * math.pi / 180.0
-                cond = torch.zeros(n_gen, 2, device=self.device)
+                cond = torch.zeros(n_gen, 4, device=self.device)
                 cond[:, 0] = math.sin(angle_rad)
                 cond[:, 1] = math.cos(angle_rad)
+                cond[:, 2] = math.sin(el_ref_rad)
+                cond[:, 3] = math.cos(el_ref_rad)
                 _, sigs = self.engine.sample_ddim(
                     n_gen, 1024, cond, steps=ddim_steps)
                 intermediates[angle_deg] = sigs
@@ -516,15 +523,18 @@ class DiffusionVisualizer:
         n_gen = 16
         ant_x, ant_y, fc, el_ref_deg, el_min_deg, el_max_deg = _aoa_geometry()
 
+        el_ref_rad = np.deg2rad(el_ref_deg)
         self.engine.model.eval()
         mean_phases, std_phases = [], []
 
         with torch.no_grad():
             for angle_deg in angles_deg:
                 angle_rad = angle_deg * math.pi / 180.0
-                cond = torch.zeros(n_gen, 2, device=self.device)
+                cond = torch.zeros(n_gen, 4, device=self.device)
                 cond[:, 0] = math.sin(angle_rad)
                 cond[:, 1] = math.cos(angle_rad)
+                cond[:, 2] = math.sin(el_ref_rad)
+                cond[:, 3] = math.cos(el_ref_rad)
 
                 gen_data, _ = self.engine.sample_ddim(n_gen, 1024, cond, steps=20)
                 n_ant = gen_data.shape[1] // 2
