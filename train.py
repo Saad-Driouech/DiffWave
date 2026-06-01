@@ -1,15 +1,39 @@
 import argparse
 import torch
+import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import yaml
 import mlflow
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import torch.nn.functional as F
 import os
 
 from models.DiffWave import DiffWaveRF, DiffusionEngine
 from utils.visualization import DiffusionVisualizer
+
+# ── Masked azimuth bands ───────────────────────────────────────────────────────
+# 5 bands of 5° width, centers at 0°, ±90°, ±180°
+MASKED_BANDS_DEG = [
+    (  -2.5,   2.5),
+    (  87.5,  92.5),
+    ( -92.5, -87.5),
+    ( 177.5, 180.0),
+    (-180.0,-177.5),
+]
+
+
+def _filter_masked_bands(dataset):
+    """Return a Subset with all samples in masked azimuth bands removed."""
+    az_arr = np.asarray(dataset.az_angles)        # [N, 2] sincos
+    az_deg = np.degrees(np.arctan2(az_arr[:, 0], az_arr[:, 1]))
+    keep   = np.ones(len(az_deg), dtype=bool)
+    for lo, hi in MASKED_BANDS_DEG:
+        keep &= ~((az_deg >= lo) & (az_deg <= hi))
+    n_removed = (~keep).sum()
+    print(f'[mask] removed {n_removed} / {len(az_deg)} training samples '
+          f'({n_removed / len(az_deg) * 100:.2f}%) in masked azimuth bands')
+    return Subset(dataset, np.where(keep)[0])
 
 # ── Arguments ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
@@ -37,6 +61,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=cfg['learning_rate'])
 # ── Data ──────────────────────────────────────────────────────────────────────
 from UniversalDataLoader import UniversalDataset
 dataset_train = UniversalDataset(task_id=132, mode="train", angle_mode='sincos')
+dataset_train = _filter_masked_bands(dataset_train)
 dataloader_train = DataLoader(dataset_train, batch_size=cfg['batch_size'], shuffle=True, num_workers=0)
 dataset_test = UniversalDataset(task_id=132, mode="test", angle_mode='sincos')
 dataloader_test = DataLoader(dataset_test, batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
