@@ -172,7 +172,7 @@ class DiffWaveRF(nn.Module):
                  input_channels=4,      # 2 Antennas (I,Q)
                  residual_channels=64,  # Internal width
                  num_layers=30,         # Deep network
-                 cond_dim=4):           # az_sin, az_cos, el_sin, el_cos
+                 cond_dim=7):           # pos_x, pos_y, pos_z, az_sin, az_cos, el_sin, el_cos
         super().__init__()
         
         self.input_channels = input_channels

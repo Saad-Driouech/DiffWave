@@ -28,7 +28,7 @@ writer = SummaryWriter(log_dir=args.log_dir)
 mlflow.set_experiment(args.experiment)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-model = DiffWaveRF(input_channels=8, residual_channels=64, cond_dim=4).to(device)
+model = DiffWaveRF(input_channels=8, residual_channels=64, cond_dim=7).to(device)
 model.train()
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────
@@ -46,22 +46,36 @@ diffusion_localizer = DiffusionVisualizer(engine=engine, writer=writer, device=d
 min_loss = float('inf')
 
 
+# Fixed position normalization constants (computed from full dataset, task 132)
+_POS_MEAN = torch.tensor([0.721, -0.034, -1.042], dtype=torch.float32)
+_POS_STD  = torch.tensor([6.922,  4.555,  0.552], dtype=torch.float32)
+
+
+def _normalize_position(pos):
+    """Normalize XYZ position using fixed dataset statistics → zero mean, unit std."""
+    mean = _POS_MEAN.to(pos.device)
+    std  = _POS_STD.to(pos.device)
+    return (pos - mean) / std
+
+
 def _prepare_batch(x, y):
     """Convert raw complex batch to normalized float I/Q and extract condition.
 
     Per-sample z-score: each sample is normalized independently over all its
     channels and time steps, avoiding batch-composition effects on scale.
+    Condition: [pos_x, pos_y, pos_z, sin(az), cos(az), sin(el), cos(el)] — shape [B, 7]
     """
     x = x.to(device)
     input_real = x.real.to(dtype=torch.float32)
     input_imag = x.imag.to(dtype=torch.float32)
     inp = torch.cat([input_real, input_imag], dim=1)   # [B, 8, 1024]
-    mean = inp.mean(dim=(1, 2), keepdim=True)           # [B, 1, 1]
-    std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8    # [B, 1, 1]
+    mean = inp.mean(dim=(1, 2), keepdim=True)
+    std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8
     inp  = (inp - mean) / std
-    az = y[1].to(device, dtype=torch.float32)
-    el = y[2].to(device, dtype=torch.float32)
-    condition = torch.cat([az, el], dim=1)   # [B, 4]
+    pos = _normalize_position(y[0].to(device, dtype=torch.float32))  # [B, 3]
+    az  = y[1].to(device, dtype=torch.float32)                        # [B, 2]
+    el  = y[2].to(device, dtype=torch.float32)                        # [B, 2]
+    condition = torch.cat([pos, az, el], dim=1)                       # [B, 7]
     return inp, condition
 
 
@@ -164,7 +178,7 @@ with mlflow.start_run():
         'model': 'DiffWaveRF',
         'input_channels': 8,
         'residual_channels': 64,
-        'cond_dim': 4,
+        'cond_dim': 7,
         'timesteps': 1000,
         'ddim_steps': 50,
         'experiment': args.experiment,
