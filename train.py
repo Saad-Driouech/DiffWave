@@ -37,9 +37,10 @@ def _filter_masked_bands(dataset):
 
 # ── Arguments ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument('--experiment', type=str, required=True, help='MLflow experiment name')
-parser.add_argument('--log_dir',    type=str, required=True, help='TensorBoard log directory')
-parser.add_argument('--output_dir', type=str, required=True, help='Directory for weights and artifacts')
+parser.add_argument('--experiment',    type=str, required=True, help='MLflow experiment name')
+parser.add_argument('--log_dir',       type=str, required=True, help='TensorBoard log directory')
+parser.add_argument('--output_dir',    type=str, required=True, help='Directory for weights and artifacts')
+parser.add_argument('--mask_az_bands', action='store_true',     help='Remove masked azimuth bands from training set')
 args = parser.parse_args()
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -61,7 +62,8 @@ optimizer = torch.optim.Adam(model.parameters(), lr=cfg['learning_rate'])
 # ── Data ──────────────────────────────────────────────────────────────────────
 from UniversalDataLoader import UniversalDataset
 dataset_train = UniversalDataset(task_id=132, mode="train", angle_mode='sincos')
-dataset_train = _filter_masked_bands(dataset_train)
+if args.mask_az_bands:
+    dataset_train = _filter_masked_bands(dataset_train)
 dataloader_train = DataLoader(dataset_train, batch_size=cfg['batch_size'], shuffle=True, num_workers=0)
 dataset_test = UniversalDataset(task_id=132, mode="test", angle_mode='sincos')
 dataloader_test = DataLoader(dataset_test, batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
@@ -209,6 +211,7 @@ with mlflow.start_run():
         'experiment': args.experiment,
         'log_dir': args.log_dir,
         'output_dir': args.output_dir,
+        'mask_az_bands': args.mask_az_bands,
     })
     for i in range(cfg['epochs']):
         train_loss = training_epoch(model, dataloader_train, optimizer, i)
