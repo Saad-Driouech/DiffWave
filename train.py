@@ -42,7 +42,9 @@ parser.add_argument('--experiment',    type=str, required=True, help='MLflow exp
 parser.add_argument('--log_dir',       type=str, required=True, help='TensorBoard log directory')
 parser.add_argument('--output_dir',    type=str, required=True, help='Directory for weights and artifacts')
 parser.add_argument('--mask_az_bands', action='store_true',     help='Remove masked azimuth bands from training set')
+parser.add_argument('--no_xyz',        action='store_true',     help='Exclude XYZ position from the condition vector (ablation)')
 args = parser.parse_args()
+COND_DIM = 6 if args.no_xyz else 9
 
 # ── Config ────────────────────────────────────────────────────────────────────
 with open("/data/beegfs/home/driouech/darcy/IQ_Diffusion/DiffWave/config/config.yaml", "r") as f:
@@ -54,7 +56,7 @@ writer = SummaryWriter(log_dir=args.log_dir)
 mlflow.set_experiment(args.experiment)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-model = DiffWaveRF(input_channels=8, residual_channels=64, cond_dim=9).to(device)
+model = DiffWaveRF(input_channels=8, residual_channels=64, cond_dim=COND_DIM).to(device)
 model.train()
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────
@@ -70,7 +72,8 @@ dataset_test = UniversalDataset(task_id=132, mode="test", angle_mode='sincos')
 dataloader_test = DataLoader(dataset_test, batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
 
 engine = DiffusionEngine(model=model, timesteps=1000)
-diffusion_localizer = DiffusionVisualizer(engine=engine, writer=writer, device=device)
+diffusion_localizer = DiffusionVisualizer(engine=engine, writer=writer, device=device,
+                                          include_xyz=not args.no_xyz)
 min_loss = float('inf')
 
 
@@ -91,8 +94,10 @@ def _prepare_batch(x, y):
 
     Per-sample z-score: each sample is normalized independently over all its
     channels and time steps, avoiding batch-composition effects on scale.
-    Condition: [pos_x, pos_y, pos_z, sin(az), cos(az), sin(el), cos(el),
-                sin(2π φ/T_chirp), cos(2π φ/T_chirp)] — shape [B, 9]
+    Condition (full):   [pos_x, pos_y, pos_z, sin(az), cos(az), sin(el), cos(el),
+                         sin(2π φ/T_chirp), cos(2π φ/T_chirp)]  → [B, 9]
+    Condition (--no_xyz): [sin(az), cos(az), sin(el), cos(el),
+                           sin(2π φ/T_chirp), cos(2π φ/T_chirp)] → [B, 6]
     """
     x = x.to(device)
     phase_sc = extract_phase_sincos(x)                                # [B, 2]
@@ -102,10 +107,13 @@ def _prepare_batch(x, y):
     mean = inp.mean(dim=(1, 2), keepdim=True)
     std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8
     inp  = (inp - mean) / std
-    pos = _normalize_position(y[0].to(device, dtype=torch.float32))  # [B, 3]
     az  = y[1].to(device, dtype=torch.float32)                        # [B, 2]
     el  = y[2].to(device, dtype=torch.float32)                        # [B, 2]
-    condition = torch.cat([pos, az, el, phase_sc], dim=1)             # [B, 9]
+    if args.no_xyz:
+        condition = torch.cat([az, el, phase_sc], dim=1)              # [B, 6]
+    else:
+        pos = _normalize_position(y[0].to(device, dtype=torch.float32))  # [B, 3]
+        condition = torch.cat([pos, az, el, phase_sc], dim=1)         # [B, 9]
     return inp, condition
 
 
@@ -208,7 +216,8 @@ with mlflow.start_run():
         'model': 'DiffWaveRF',
         'input_channels': 8,
         'residual_channels': 64,
-        'cond_dim': 9,
+        'cond_dim': COND_DIM,
+        'no_xyz': args.no_xyz,
         'timesteps': 1000,
         'ddim_steps': 50,
         'experiment': args.experiment,

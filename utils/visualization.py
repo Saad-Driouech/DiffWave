@@ -97,11 +97,24 @@ def angle_deg_to_cossin(angle):
 
 
 class DiffusionVisualizer:
-    def __init__(self, writer, engine, device, n_eval=16):
+    def __init__(self, writer, engine, device, n_eval=16, include_xyz=True):
         self.writer = writer
         self.engine = engine
         self.device = device
         self.n_eval = n_eval
+        self.include_xyz = include_xyz
+        # Condition layout differs based on whether XYZ is included.
+        # Both layouts always end with (sin φ, cos φ).
+        self.cond_dim = 9 if include_xyz else 6
+        # Slot indices used by AoA tests below:
+        if include_xyz:
+            self._slot_az_sin, self._slot_az_cos = 3, 4
+            self._slot_el_sin, self._slot_el_cos = 5, 6
+            self._slot_phi_cos = 8
+        else:
+            self._slot_az_sin, self._slot_az_cos = 0, 1
+            self._slot_el_sin, self._slot_el_cos = 2, 3
+            self._slot_phi_cos = 5
         # Load n_eval fixed test samples once at init so every epoch visualizes
         # the exact same samples — enables meaningful epoch-over-epoch comparison.
         from UniversalDataLoader import UniversalDataset
@@ -111,16 +124,19 @@ class DiffusionVisualizer:
         for i in range(n_eval):
             x, (pos, az, el) = ds[i]
             signals.append(x)
-            pos_norm = torch.tensor(_norm_pos(pos.numpy()), dtype=torch.float32)
-            geom_conds.append(torch.cat([pos_norm, az.float(), el.float()]))  # [7]
+            if include_xyz:
+                pos_norm = torch.tensor(_norm_pos(pos.numpy()), dtype=torch.float32)
+                geom_conds.append(torch.cat([pos_norm, az.float(), el.float()]))  # [7]
+            else:
+                geom_conds.append(torch.cat([az.float(), el.float()]))            # [4]
         x = torch.stack(signals)                          # [n_eval, 4, 1024] complex64
         phase_sc = extract_phase_sincos(x.to(device))     # [n_eval, 2]
         inp = torch.cat([x.real.float(), x.imag.float()], dim=1)  # [n_eval, 8, 1024]
         mean = inp.mean(dim=(1, 2), keepdim=True)
         std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8
         self.fixed_batch     = ((inp - mean) / std).to(device)
-        geom = torch.stack(geom_conds).to(device)         # [n_eval, 7]
-        self.fixed_condition = torch.cat([geom, phase_sc], dim=1)  # [n_eval, 9]
+        geom = torch.stack(geom_conds).to(device)         # [n_eval, 7 or 4]
+        self.fixed_condition = torch.cat([geom, phase_sc], dim=1)  # [n_eval, 9 or 6]
 
     def _to_complex(self, batch):
         """Convert DiffWave (B, 2*n_ant, L) → complex numpy (B, L, n_ant)."""
@@ -175,8 +191,8 @@ class DiffusionVisualizer:
 
     def log_denoising_chain(self, epoch):
         """Visualizes the reverse process: Noise -> Signal"""
-        cond = torch.zeros(1, 9).to(self.device)
-        cond[:, 8] = 1.0   # cos(2π·0/T) = 1, phase fixed at 0
+        cond = torch.zeros(1, self.cond_dim).to(self.device)
+        cond[:, self._slot_phi_cos] = 1.0   # cos(2π·0/T) = 1, phase fixed at 0
 
         self.engine.model.eval()
         with torch.no_grad():
@@ -308,11 +324,14 @@ class DiffusionVisualizer:
 
         _, _, _, el_ref_deg, _, _ = _aoa_geometry()
         el_ref_rad = np.deg2rad(el_ref_deg)
-        conds = torch.tensor(
-            [[0.0, 0.0, 0.0, math.sin(a), math.cos(a), math.sin(el_ref_rad), math.cos(el_ref_rad)]
-             for a in angles_rad],
-            dtype=torch.float32, device=self.device
-        )
+        conds = torch.zeros(len(angles_rad), self.cond_dim,
+                            dtype=torch.float32, device=self.device)
+        for i, a in enumerate(angles_rad):
+            conds[i, self._slot_az_sin] = math.sin(a)
+            conds[i, self._slot_az_cos] = math.cos(a)
+            conds[i, self._slot_el_sin] = math.sin(el_ref_rad)
+            conds[i, self._slot_el_cos] = math.cos(el_ref_rad)
+            conds[i, self._slot_phi_cos] = 1.0   # phase fixed at 0
 
         self.engine.model.eval()
         gen_signals = []
@@ -423,12 +442,12 @@ class DiffusionVisualizer:
         with torch.no_grad():
             for ax, angle_deg in zip(axes, fixed_angles_deg):
                 angle_rad = angle_deg * math.pi / 180.0
-                cond = torch.zeros(n_gen, 9, device=self.device)
-                cond[:, 3] = math.sin(angle_rad)
-                cond[:, 4] = math.cos(angle_rad)
-                cond[:, 5] = math.sin(el_ref_rad)
-                cond[:, 6] = math.cos(el_ref_rad)
-                cond[:, 8] = 1.0   # phase fixed at 0
+                cond = torch.zeros(n_gen, self.cond_dim, device=self.device)
+                cond[:, self._slot_az_sin] = math.sin(angle_rad)
+                cond[:, self._slot_az_cos] = math.cos(angle_rad)
+                cond[:, self._slot_el_sin] = math.sin(el_ref_rad)
+                cond[:, self._slot_el_cos] = math.cos(el_ref_rad)
+                cond[:, self._slot_phi_cos] = 1.0   # phase fixed at 0
 
                 gen_data, _ = self.engine.sample_ddim(n_gen, 1024, cond, steps=20)
                 n_ant = gen_data.shape[1] // 2
@@ -481,12 +500,12 @@ class DiffusionVisualizer:
         with torch.no_grad():
             for angle_deg in fixed_angles_deg:
                 angle_rad = angle_deg * math.pi / 180.0
-                cond = torch.zeros(n_gen, 9, device=self.device)
-                cond[:, 3] = math.sin(angle_rad)
-                cond[:, 4] = math.cos(angle_rad)
-                cond[:, 5] = math.sin(el_ref_rad)
-                cond[:, 6] = math.cos(el_ref_rad)
-                cond[:, 8] = 1.0   # phase fixed at 0
+                cond = torch.zeros(n_gen, self.cond_dim, device=self.device)
+                cond[:, self._slot_az_sin] = math.sin(angle_rad)
+                cond[:, self._slot_az_cos] = math.cos(angle_rad)
+                cond[:, self._slot_el_sin] = math.sin(el_ref_rad)
+                cond[:, self._slot_el_cos] = math.cos(el_ref_rad)
+                cond[:, self._slot_phi_cos] = 1.0   # phase fixed at 0
                 _, sigs = self.engine.sample_ddim(
                     n_gen, 1024, cond, steps=ddim_steps)
                 intermediates[angle_deg] = sigs
@@ -546,12 +565,12 @@ class DiffusionVisualizer:
         with torch.no_grad():
             for angle_deg in angles_deg:
                 angle_rad = angle_deg * math.pi / 180.0
-                cond = torch.zeros(n_gen, 9, device=self.device)
-                cond[:, 3] = math.sin(angle_rad)
-                cond[:, 4] = math.cos(angle_rad)
-                cond[:, 5] = math.sin(el_ref_rad)
-                cond[:, 6] = math.cos(el_ref_rad)
-                cond[:, 8] = 1.0   # phase fixed at 0
+                cond = torch.zeros(n_gen, self.cond_dim, device=self.device)
+                cond[:, self._slot_az_sin] = math.sin(angle_rad)
+                cond[:, self._slot_az_cos] = math.cos(angle_rad)
+                cond[:, self._slot_el_sin] = math.sin(el_ref_rad)
+                cond[:, self._slot_el_cos] = math.cos(el_ref_rad)
+                cond[:, self._slot_phi_cos] = 1.0   # phase fixed at 0
 
                 gen_data, _ = self.engine.sample_ddim(n_gen, 1024, cond, steps=20)
                 n_ant = gen_data.shape[1] // 2
