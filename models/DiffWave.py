@@ -168,11 +168,11 @@ class DilatedResidualBlock(nn.Module):
         # Residual connection (input + processed)
         return (x + out), skip
 class DiffWaveRF(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  input_channels=4,      # 2 Antennas (I,Q)
                  residual_channels=64,  # Internal width
                  num_layers=30,         # Deep network
-                 cond_dim=7):           # pos_x, pos_y, pos_z, az_sin, az_cos, el_sin, el_cos
+                 cond_dim=9):           # pos_x, pos_y, pos_z, az_sin, az_cos, el_sin, el_cos, phi_sin, phi_cos
         super().__init__()
         
         self.input_channels = input_channels

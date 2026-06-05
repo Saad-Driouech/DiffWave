@@ -105,19 +105,22 @@ class DiffusionVisualizer:
         # Load n_eval fixed test samples once at init so every epoch visualizes
         # the exact same samples — enables meaningful epoch-over-epoch comparison.
         from UniversalDataLoader import UniversalDataset
+        from utils.chirp_phase import extract_phase_sincos
         ds = UniversalDataset(task_id=132, mode='test', angle_mode='sincos')
-        signals, conditions = [], []
+        signals, geom_conds = [], []
         for i in range(n_eval):
             x, (pos, az, el) = ds[i]
             signals.append(x)
             pos_norm = torch.tensor(_norm_pos(pos.numpy()), dtype=torch.float32)
-            conditions.append(torch.cat([pos_norm, az.float(), el.float()]))  # [7]
+            geom_conds.append(torch.cat([pos_norm, az.float(), el.float()]))  # [7]
         x = torch.stack(signals)                          # [n_eval, 4, 1024] complex64
+        phase_sc = extract_phase_sincos(x.to(device))     # [n_eval, 2]
         inp = torch.cat([x.real.float(), x.imag.float()], dim=1)  # [n_eval, 8, 1024]
         mean = inp.mean(dim=(1, 2), keepdim=True)
         std  = inp.std(dim=(1, 2), keepdim=True) + 1e-8
         self.fixed_batch     = ((inp - mean) / std).to(device)
-        self.fixed_condition = torch.stack(conditions).to(device)  # [n_eval, 7]
+        geom = torch.stack(geom_conds).to(device)         # [n_eval, 7]
+        self.fixed_condition = torch.cat([geom, phase_sc], dim=1)  # [n_eval, 9]
 
     def _to_complex(self, batch):
         """Convert DiffWave (B, 2*n_ant, L) → complex numpy (B, L, n_ant)."""
@@ -126,7 +129,7 @@ class DiffusionVisualizer:
 
     def log_all(self, epoch):
         real_batch = self.fixed_batch     # [N, 8, 1024]
-        condition  = self.fixed_condition # [N, 2]
+        condition  = self.fixed_condition # [N, 9]
         N = real_batch.shape[0]
         print(f"[DiffusionVisualizer] log_all: fixed_batch={real_batch.shape}, "
               f"condition={condition.shape}, epoch={epoch}")
@@ -172,7 +175,9 @@ class DiffusionVisualizer:
 
     def log_denoising_chain(self, epoch):
         """Visualizes the reverse process: Noise -> Signal"""
-        cond = torch.zeros(1, 7).to(self.device)
+        cond = torch.zeros(1, 9).to(self.device)
+        cond[:, 8] = 1.0   # cos(2π·0/T) = 1, phase fixed at 0
+
         self.engine.model.eval()
         with torch.no_grad():
             _, sigs = self.engine.sample_ddim(1, 1024, cond, steps=50)
@@ -418,11 +423,12 @@ class DiffusionVisualizer:
         with torch.no_grad():
             for ax, angle_deg in zip(axes, fixed_angles_deg):
                 angle_rad = angle_deg * math.pi / 180.0
-                cond = torch.zeros(n_gen, 7, device=self.device)
+                cond = torch.zeros(n_gen, 9, device=self.device)
                 cond[:, 3] = math.sin(angle_rad)
                 cond[:, 4] = math.cos(angle_rad)
                 cond[:, 5] = math.sin(el_ref_rad)
                 cond[:, 6] = math.cos(el_ref_rad)
+                cond[:, 8] = 1.0   # phase fixed at 0
 
                 gen_data, _ = self.engine.sample_ddim(n_gen, 1024, cond, steps=20)
                 n_ant = gen_data.shape[1] // 2
@@ -475,11 +481,12 @@ class DiffusionVisualizer:
         with torch.no_grad():
             for angle_deg in fixed_angles_deg:
                 angle_rad = angle_deg * math.pi / 180.0
-                cond = torch.zeros(n_gen, 7, device=self.device)
+                cond = torch.zeros(n_gen, 9, device=self.device)
                 cond[:, 3] = math.sin(angle_rad)
                 cond[:, 4] = math.cos(angle_rad)
                 cond[:, 5] = math.sin(el_ref_rad)
                 cond[:, 6] = math.cos(el_ref_rad)
+                cond[:, 8] = 1.0   # phase fixed at 0
                 _, sigs = self.engine.sample_ddim(
                     n_gen, 1024, cond, steps=ddim_steps)
                 intermediates[angle_deg] = sigs
@@ -539,11 +546,12 @@ class DiffusionVisualizer:
         with torch.no_grad():
             for angle_deg in angles_deg:
                 angle_rad = angle_deg * math.pi / 180.0
-                cond = torch.zeros(n_gen, 7, device=self.device)
+                cond = torch.zeros(n_gen, 9, device=self.device)
                 cond[:, 3] = math.sin(angle_rad)
                 cond[:, 4] = math.cos(angle_rad)
                 cond[:, 5] = math.sin(el_ref_rad)
                 cond[:, 6] = math.cos(el_ref_rad)
+                cond[:, 8] = 1.0   # phase fixed at 0
 
                 gen_data, _ = self.engine.sample_ddim(n_gen, 1024, cond, steps=20)
                 n_ant = gen_data.shape[1] // 2

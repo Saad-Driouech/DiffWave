@@ -11,6 +11,7 @@ import os
 
 from models.DiffWave import DiffWaveRF, DiffusionEngine
 from utils.visualization import DiffusionVisualizer
+from utils.chirp_phase import extract_phase_sincos
 
 # ── Masked azimuth bands ───────────────────────────────────────────────────────
 # 5 bands of 5° width, centers at 0°, ±90°, ±180°
@@ -53,7 +54,7 @@ writer = SummaryWriter(log_dir=args.log_dir)
 mlflow.set_experiment(args.experiment)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-model = DiffWaveRF(input_channels=8, residual_channels=64, cond_dim=7).to(device)
+model = DiffWaveRF(input_channels=8, residual_channels=64, cond_dim=9).to(device)
 model.train()
 
 # ── Optimizer ─────────────────────────────────────────────────────────────────
@@ -90,9 +91,11 @@ def _prepare_batch(x, y):
 
     Per-sample z-score: each sample is normalized independently over all its
     channels and time steps, avoiding batch-composition effects on scale.
-    Condition: [pos_x, pos_y, pos_z, sin(az), cos(az), sin(el), cos(el)] — shape [B, 7]
+    Condition: [pos_x, pos_y, pos_z, sin(az), cos(az), sin(el), cos(el),
+                sin(2π φ/T_chirp), cos(2π φ/T_chirp)] — shape [B, 9]
     """
     x = x.to(device)
+    phase_sc = extract_phase_sincos(x)                                # [B, 2]
     input_real = x.real.to(dtype=torch.float32)
     input_imag = x.imag.to(dtype=torch.float32)
     inp = torch.cat([input_real, input_imag], dim=1)   # [B, 8, 1024]
@@ -102,7 +105,7 @@ def _prepare_batch(x, y):
     pos = _normalize_position(y[0].to(device, dtype=torch.float32))  # [B, 3]
     az  = y[1].to(device, dtype=torch.float32)                        # [B, 2]
     el  = y[2].to(device, dtype=torch.float32)                        # [B, 2]
-    condition = torch.cat([pos, az, el], dim=1)                       # [B, 7]
+    condition = torch.cat([pos, az, el, phase_sc], dim=1)             # [B, 9]
     return inp, condition
 
 
@@ -205,7 +208,7 @@ with mlflow.start_run():
         'model': 'DiffWaveRF',
         'input_channels': 8,
         'residual_channels': 64,
-        'cond_dim': 7,
+        'cond_dim': 9,
         'timesteps': 1000,
         'ddim_steps': 50,
         'experiment': args.experiment,
