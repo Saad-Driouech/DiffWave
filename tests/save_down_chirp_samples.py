@@ -11,22 +11,16 @@ import argparse
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import spectrogram
 
 from UniversalDataLoader import UniversalDataset
-
-FS = 4.32e7  # sampling rate [Hz]
+from utils.visualization import _gnss_spectrogram_db
 
 
 def plot_sample(sig, idx, slope, f_start, az_deg, el_deg, out_path):
     """sig: complex [4, L].  Save a 4-row spectrogram figure."""
     fig, axes = plt.subplots(4, 1, figsize=(7, 12), sharex=True)
     for a in range(4):
-        f, t, Sxx = spectrogram(sig[a].numpy(), fs=FS, nperseg=64, noverlap=48,
-                                return_onesided=False, scaling='density')
-        f = np.fft.fftshift(f)
-        Sxx = np.fft.fftshift(Sxx, axes=0)
-        Sxx_db = 10 * np.log10(Sxx + 1e-20)
+        f, t, Sxx_db = _gnss_spectrogram_db(sig[a].numpy())
         im = axes[a].pcolormesh(t * 1e3, f, Sxx_db, shading='auto', cmap='turbo',
                                 vmin=-140, vmax=-60)
         axes[a].set_ylabel(f'Antenna {a+1}\nf [Hz]')
