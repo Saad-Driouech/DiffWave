@@ -54,7 +54,10 @@ POS_MEAN = np.array([0.721, -0.034, -1.042], dtype=np.float32)
 POS_STD  = np.array([6.922,  4.555,  0.552], dtype=np.float32)
 
 T_CHIRP_S = 33.19e-6
-PHASE_TOL_S = 0.10 * T_CHIRP_S        # 10 % of period
+# 5 % of the chirp period.  Tighter than the original 10 % so the rate metric
+# can actually discriminate between models; still above the spectrogram time
+# resolution (≈ 1.6 µs) so the threshold is not measuring estimator noise.
+PHASE_TOL_S = 0.05 * T_CHIRP_S
 
 COND_DIM_BY_KEY = {
     'xyz_full':   9,
@@ -121,6 +124,13 @@ def dphi_baseline_pair(gen):
     return torch.angle(torch.mean(a2 * a1.conj(), dim=1)).cpu().numpy()
 
 
+def dphi_baseline_pair_complex(iq):
+    """Same estimator but for complex input [B, n_ant, L]."""
+    a1 = iq[:, 0]
+    a2 = iq[:, 1]
+    return torch.angle(torch.mean(a2 * a1.conj(), dim=1)).cpu().numpy()
+
+
 def phase_seconds_from_iq(iq_complex):
     sc = extract_phase_sincos(iq_complex.unsqueeze(0) if iq_complex.dim() == 2
                               else iq_complex)
@@ -136,19 +146,47 @@ def circular_diff(a, b, period):
 
 
 def scalar_metrics(real_iq, gen_real):
+    """All three metrics computed in the per-sample z-score normalised domain
+    the model was trained in, so the model output and the real reference are
+    on the same scale.
+
+    Returns
+    -------
+    amp_ratio : ⟨|gen|⟩ / ⟨|real_normalised|⟩.  ≈ 1 if the generated signal has
+                the right scale in the training domain.
+    snr_db    : reconstruction SNR  10·log10(‖real_normalised‖² / ‖real_normalised − gen‖²).
+                Larger is better.  ≈ 0 dB for random output, → ∞ for perfect.
+    fmse      : MSE between the normalised real PSD and the generated PSD.
+                Now directly interpretable as spectral mismatch.
+    """
     n_ant = gen_real.shape[1] // 2
-    gen_c = gen_real[:, :n_ant] + 1j * gen_real[:, n_ant:]
-    amp_real = real_iq.abs().mean().item()
-    amp_gen  = gen_c.abs().mean().item()
-    p_real   = (real_iq.abs() ** 2).mean().item()
-    p_gen    = (gen_c.abs() ** 2).mean().item()
-    snr_db   = 10 * np.log10(max(p_gen, 1e-20) / max(p_real, 1e-20))
-    # Frequency MSE: per-sample PSD L2 distance
-    def psd(x):
-        X = torch.fft.fftshift(torch.fft.fft(x, dim=-1), dim=-1)
-        return (X.abs() ** 2).mean(dim=1)        # avg over antennas
-    fmse = ((psd(real_iq) - psd(gen_c)) ** 2).mean().item()
-    return amp_gen / max(amp_real, 1e-20), snr_db, fmse
+
+    # Bring real_iq into the same domain as the model output
+    real_stacked = torch.cat([real_iq.real, real_iq.imag],
+                             dim=1).to(torch.float32)              # [B, 8, L]
+    mean = real_stacked.mean(dim=(1, 2), keepdim=True)
+    std  = real_stacked.std (dim=(1, 2), keepdim=True) + 1e-8
+    real_norm = (real_stacked - mean) / std                        # [B, 8, L]
+
+    # Complex magnitudes in the normalised domain
+    real_c = real_norm[:, :n_ant] + 1j * real_norm[:, n_ant:]
+    gen_c  = gen_real [:, :n_ant] + 1j * gen_real [:, n_ant:]
+    amp_real = real_c.abs().mean().item()
+    amp_gen  = gen_c .abs().mean().item()
+    amp_ratio = amp_gen / max(amp_real, 1e-20)
+
+    # Reconstruction SNR: signal power / error power, both in normalised domain
+    sig_power = (real_norm ** 2).mean().item()
+    err_power = ((real_norm - gen_real) ** 2).mean().item()
+    snr_db = 10 * np.log10(max(sig_power, 1e-20) / max(err_power, 1e-20))
+
+    # Spectral MSE on normalised PSDs
+    def psd(x_c):
+        X = torch.fft.fftshift(torch.fft.fft(x_c, dim=-1), dim=-1)
+        return (X.abs() ** 2).mean(dim=1)
+    fmse = ((psd(real_c) - psd(gen_c)) ** 2).mean().item()
+
+    return amp_ratio, snr_db, fmse
 
 
 # ── eval phase ────────────────────────────────────────────────────────────────
@@ -171,12 +209,12 @@ def evaluate(args):
     eval_points = ([('in_band',  c) for c in BAND_CENTERS_DEG] +
                    [('out_band', r) for r in REFERENCE_AZIMUTHS])
 
-    ant_x, ant_y, fc, el_ref_deg, _, _ = _aoa_geometry()
-    el_ref_rad = np.deg2rad(el_ref_deg)
+    ant_x, ant_y, fc, _, _, _ = _aoa_geometry()
 
     # per-sample records: lists keyed by model
     rec = {k: {'azimuth': [], 'region': [], 'dphi_measured': [],
-               'dphi_theory': [], 'phase_real': [], 'phase_gen': [],
+               'dphi_real': [], 'dphi_theory': [],
+               'phase_real': [], 'phase_gen': [],
                'amp_ratio': [], 'snr_db': [], 'freq_mse': []}
            for k in available}
     # representative spectrogram pairs for the grid
@@ -208,9 +246,14 @@ def evaluate(args):
         phi_b   = torch.stack(phis).to(device)
         B       = real_iq.shape[0]
 
-        actual_az_rad = np.deg2rad(target_deg)
-        theory_dphi = float(_dphi_baseline((0, 1), actual_az_rad, el_ref_rad,
-                                           ant_x, ant_y, fc))
+        # Per-sample theory using each conditioning sample's actual az/el.
+        # Earlier versions used a single el_ref for all samples, which mixed in
+        # a 0–60% elevation-driven offset on top of any model/data error.
+        az_rad_per = torch.atan2(az_b[:, 0], az_b[:, 1]).cpu().numpy()
+        el_rad_per = torch.atan2(el_b[:, 0], el_b[:, 1]).cpu().numpy()
+        theory_dphi_per = _dphi_baseline((0, 1), az_rad_per, el_rad_per,
+                                         ant_x, ant_y, fc)             # [B]
+        dphi_real = dphi_baseline_pair_complex(real_iq)  # [B], computed once per az
         if target_deg in args.spec_grid_azimuths:
             spec_real[target_deg] = real_iq[0].cpu().numpy()
 
@@ -225,7 +268,8 @@ def evaluate(args):
                 rec[key]['azimuth'].append(target_deg)
                 rec[key]['region'].append(region)
                 rec[key]['dphi_measured'].append(float(dphi_meas[j]))
-                rec[key]['dphi_theory'].append(theory_dphi)
+                rec[key]['dphi_real'].append(float(dphi_real[j]))
+                rec[key]['dphi_theory'].append(float(theory_dphi_per[j]))
                 rec[key]['amp_ratio'].append(amp_ratio)
                 rec[key]['snr_db'].append(snr_db)
                 rec[key]['freq_mse'].append(fmse)
@@ -289,12 +333,30 @@ def _aggregate_per_az(raw, key):
     return uniq, np.array(mean_meas), np.array(std_meas), np.array(mean_theory)
 
 
+def _real_curve(raw, key):
+    """Per-azimuth mean and std of real-data Δφ, from any one model's records
+    (real data is shared across models so we just read from `key`)."""
+    az = raw[f'{key}__azimuth']
+    dr = raw[f'{key}__dphi_real']
+    uniq = np.unique(az)
+    mean_r = np.array([dr[az == u].mean() for u in uniq])
+    std_r  = np.array([dr[az == u].std()  for u in uniq])
+    return uniq, mean_r, std_r
+
+
 def plot_aoa_regression(args, raw, keys, suffix):
     fig, ax = plt.subplots(figsize=(10, 5))
     _shade_masked_bands(ax)
     grid = np.linspace(-180, 180, 361)
     ax.plot(grid, _theory_curve(grid), 'r--', lw=1.2,
             label='Theory (planar)', zorder=2)
+    if keys and f'{keys[0]}__dphi_real' in raw:
+        ur, mr, sr = _real_curve(raw, keys[0])
+        order = np.argsort(ur)
+        ax.errorbar(ur[order], mr[order], yerr=sr[order],
+                    capsize=2, marker='s', markersize=5,
+                    color='black', linestyle=':', linewidth=1.5,
+                    label='Real data (mean ± std)', zorder=2.5)
     for key in keys:
         uniq, mm, ms, _ = _aggregate_per_az(raw, key)
         order = np.argsort(uniq)
@@ -309,6 +371,63 @@ def plot_aoa_regression(args, raw, keys, suffix):
     ax.legend(loc='best', frameon=True)
     fig.tight_layout()
     _save(fig, args.output_dir, f'aoa_regression_{suffix}')
+
+
+def plot_aoa_error_model_vs_data(args, raw, keys, suffix):
+    """|⟨gen⟩ − ⟨real⟩| per model — the model's bias from the data."""
+    if not keys or f'{keys[0]}__dphi_real' not in raw:
+        print('  skip aoa_error_model_vs_data: dphi_real not in raw.npz '
+              '(re-run --mode eval)')
+        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    _shade_masked_bands(ax)
+    for key in keys:
+        az = raw[f'{key}__azimuth']
+        dm = raw[f'{key}__dphi_measured']
+        dr = raw[f'{key}__dphi_real']
+        uniq = np.unique(az)
+        err = np.array([abs(dm[az == u].mean() - dr[az == u].mean())
+                        for u in uniq])
+        order = np.argsort(uniq)
+        ax.plot(uniq[order], np.rad2deg(err[order]),
+                marker='o', markersize=5, **MODEL_STYLE[key])
+    ax.set_xlim(-180, 180)
+    ax.set_xlabel('Azimuth (°)')
+    ax.set_ylabel('|⟨Δφ_gen⟩ − ⟨Δφ_real⟩|  (°)')
+    ax.set_title(f'Model bias from data — {suffix}')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='best', fontsize=9)
+    fig.tight_layout()
+    _save(fig, args.output_dir, f'aoa_error_model_vs_data_{suffix}')
+
+
+def plot_aoa_error_data_vs_theory(args, raw, keys, suffix):
+    """|⟨real⟩ − theory| — the simulator's bias from the planar formula.
+    Identical across all models, so plotted once per comparison."""
+    if not keys or f'{keys[0]}__dphi_real' not in raw:
+        print('  skip aoa_error_data_vs_theory: dphi_real not in raw.npz '
+              '(re-run --mode eval)')
+        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    _shade_masked_bands(ax)
+    az = raw[f'{keys[0]}__azimuth']
+    dr = raw[f'{keys[0]}__dphi_real']
+    dt = raw[f'{keys[0]}__dphi_theory']
+    uniq = np.unique(az)
+    err = np.array([abs(dr[az == u].mean() - dt[az == u].mean())
+                    for u in uniq])
+    order = np.argsort(uniq)
+    ax.plot(uniq[order], np.rad2deg(err[order]),
+            marker='s', markersize=5, color='black', linestyle=':',
+            label='Real vs theory')
+    ax.set_xlim(-180, 180)
+    ax.set_xlabel('Azimuth (°)')
+    ax.set_ylabel('|⟨Δφ_real⟩ − Δφ_theory|  (°)')
+    ax.set_title(f'Simulator bias from theory — {suffix}')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='best', fontsize=9)
+    fig.tight_layout()
+    _save(fig, args.output_dir, f'aoa_error_data_vs_theory_{suffix}')
 
 
 def plot_aoa_error(args, raw, keys, suffix):
@@ -330,6 +449,19 @@ def plot_aoa_error(args, raw, keys, suffix):
     _save(fig, args.output_dir, f'aoa_error_{suffix}')
 
 
+def _normalize_real_iq(iq):
+    """Per-sample z-score on [n_ant, L] complex, matching train.py's
+    `_prepare_batch`.  Puts the real reference on the same absolute scale as
+    the model's z-score-domain output, so the colormap shows comparable
+    noise floors and chirp ridges."""
+    real = np.real(iq).astype(np.float32)
+    imag = np.imag(iq).astype(np.float32)
+    stacked = np.concatenate([real, imag], axis=0)
+    norm = (stacked - stacked.mean()) / (stacked.std() + 1e-8)
+    n_ant = iq.shape[0]
+    return norm[:n_ant] + 1j * norm[n_ant:]
+
+
 def _plot_spec_panel(ax, sig_complex):
     f, t, S_db = _gnss_spectrogram_db(sig_complex)
     im = ax.pcolormesh(t * 1e3, f, S_db, shading='auto', cmap='turbo',
@@ -347,7 +479,7 @@ def plot_spec_grid_antenna1(args, raw, keys, suffix):
     fig, axes = plt.subplots(n_az, n_col, figsize=(3.2 * n_col, 3.0 * n_az),
                              squeeze=False)
     for i, az in enumerate(azs):
-        real_arr = raw[f'spec_real__az{az}']    # [4, L] complex
+        real_arr = _normalize_real_iq(raw[f'spec_real__az{az}'])   # [4, L] complex
         _plot_spec_panel(axes[i, 0], real_arr[0])
         axes[i, 0].set_title(f'Real — az={az:+.0f}°', fontsize=9)
         for j, key in enumerate(keys, start=1):
@@ -366,7 +498,7 @@ def plot_spec_grid_allants(args, raw, keys, suffix):
     sub = os.path.join(args.output_dir, f'spectrogram_grid_allants_{suffix}')
     os.makedirs(sub, exist_ok=True)
     for az in raw['spec_azimuths']:
-        real_arr = raw[f'spec_real__az{az}']   # [4, L] complex
+        real_arr = _normalize_real_iq(raw[f'spec_real__az{az}'])   # [4, L] complex
         n_col = 1 + len(keys)
         fig, axes = plt.subplots(4, n_col, figsize=(3.2 * n_col, 11),
                                  squeeze=False)
@@ -463,6 +595,48 @@ def plot_phase_match(args, raw, keys, suffix):
     _save(fig, args.output_dir, f'phase_match_{suffix}')
 
 
+def plot_phase_error_median(args, raw, keys, suffix):
+    """Continuous companion to the rate plot: median |Δφ_gen − Δφ_real| per
+    region per model.  Error bars show the 25th / 75th percentiles.
+    Spectrogram-based phase extraction has ~1.6 µs intrinsic noise; values
+    below that line are at the resolution floor of the estimator."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    regions = ['in_band', 'out_band']
+    region_labels = ['Inside masked bands', 'Outside masked bands']
+    width = 0.8 / len(keys)
+    xs = np.arange(len(regions))
+    for j, key in enumerate(keys):
+        meds, lo_err, hi_err = [], [], []
+        for region in regions:
+            pr = raw[f'{key}__phase_real']
+            pg = raw[f'{key}__phase_gen']
+            rg = raw[f'{key}__region']
+            m = rg == region
+            if m.sum() == 0:
+                meds.append(0); lo_err.append(0); hi_err.append(0); continue
+            diffs_us = np.array([circular_diff(a, b, T_CHIRP_S) * 1e6
+                                 for a, b in zip(pr[m], pg[m])])
+            med = np.median(diffs_us)
+            q25, q75 = np.percentile(diffs_us, [25, 75])
+            meds.append(med); lo_err.append(med - q25); hi_err.append(q75 - med)
+        offset = (j - (len(keys) - 1) / 2) * width
+        ax.bar(xs + offset, meds, width=width,
+               yerr=[lo_err, hi_err], capsize=3,
+               color=MODEL_BAR_COLOR[key], edgecolor='black', linewidth=0.6,
+               label=MODEL_STYLE[key]['label'])
+    # Estimator noise floor reference line
+    ax.axhline(1.58, color='gray', linestyle=':', linewidth=1.2,
+               label='Estimator resolution (~1.6 µs)')
+    ax.set_xticks(xs)
+    ax.set_xticklabels(region_labels)
+    ax.set_ylabel('Median |Δφ_gen − Δφ_real|  (µs)')
+    ax.set_title(f'Chirp phase error (median ± IQR) — {suffix}')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.legend(loc='best', fontsize=9)
+    fig.tight_layout()
+    _save(fig, args.output_dir, f'phase_error_median_{suffix}')
+
+
 def plot_degradation_profile(args, raw, keys, suffix):
     """Per-azimuth AoA error vs distance from nearest unmasked azimuth.
     Only meaningful for azimuths inside masked bands."""
@@ -548,10 +722,13 @@ def plot_phase(args):
     print(f'Plotting comparison {args.compare!r}: {keys}')
     plot_aoa_regression(args, raw, keys, args.compare)
     plot_aoa_error(args, raw, keys, args.compare)
+    plot_aoa_error_model_vs_data(args, raw, keys, args.compare)
+    plot_aoa_error_data_vs_theory(args, raw, keys, args.compare)
     plot_spec_grid_antenna1(args, raw, keys, args.compare)
     plot_spec_grid_allants(args, raw, keys, args.compare)
     plot_scalar_metrics(args, raw, keys, args.compare)
     plot_phase_match(args, raw, keys, args.compare)
+    plot_phase_error_median(args, raw, keys, args.compare)
     plot_degradation_profile(args, raw, keys, args.compare)
     write_summary(args, raw, keys, args.compare)
 
