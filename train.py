@@ -14,37 +14,39 @@ from utils.visualization import DiffusionVisualizer
 from utils.chirp_phase import extract_phase_sincos
 
 # ── Masked azimuth bands ───────────────────────────────────────────────────────
-# 5 bands of 5° width, centers at 0°, ±90°, ±180°
-MASKED_BANDS_DEG = [
-    (  -2.5,   2.5),
-    (  87.5,  92.5),
-    ( -92.5, -87.5),
-    ( 177.5, 180.0),
-    (-180.0,-177.5),
-]
+# 5 bands centered at 0°, ±90°, ±180°. Width set by --mask_half_width.
+MASKED_BAND_CENTERS_DEG = [0.0, 90.0, -90.0, 180.0, -180.0]
 
 
-def _filter_masked_bands(dataset):
-    """Return a Subset with all samples in masked azimuth bands removed."""
+def _masked_bands(half_width_deg):
+    return [(c - half_width_deg, c + half_width_deg)
+            for c in MASKED_BAND_CENTERS_DEG]
+
+
+def _filter_masked_bands(dataset, bands):
+    """Return a Subset with all samples in the given bands removed."""
     az_arr = np.asarray(dataset.az_angles)        # [N, 2] sincos
     az_deg = np.degrees(np.arctan2(az_arr[:, 0], az_arr[:, 1]))
     keep   = np.ones(len(az_deg), dtype=bool)
-    for lo, hi in MASKED_BANDS_DEG:
+    for lo, hi in bands:
         keep &= ~((az_deg >= lo) & (az_deg <= hi))
     n_removed = (~keep).sum()
     print(f'[mask] removed {n_removed} / {len(az_deg)} training samples '
-          f'({n_removed / len(az_deg) * 100:.2f}%) in masked azimuth bands')
+          f'({n_removed / len(az_deg) * 100:.2f}%) in masked azimuth bands '
+          f'(bands={bands})')
     return Subset(dataset, np.where(keep)[0])
 
 # ── Arguments ─────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument('--experiment',    type=str, required=True, help='MLflow experiment name')
-parser.add_argument('--log_dir',       type=str, required=True, help='TensorBoard log directory')
-parser.add_argument('--output_dir',    type=str, required=True, help='Directory for weights and artifacts')
-parser.add_argument('--mask_az_bands', action='store_true',     help='Remove masked azimuth bands from training set')
-parser.add_argument('--no_xyz',        action='store_true',     help='Exclude XYZ position from the condition vector (ablation)')
+parser.add_argument('--experiment',      type=str, required=True, help='MLflow experiment name')
+parser.add_argument('--log_dir',         type=str, required=True, help='TensorBoard log directory')
+parser.add_argument('--output_dir',      type=str, required=True, help='Directory for weights and artifacts')
+parser.add_argument('--mask_az_bands',   action='store_true',     help='Remove masked azimuth bands from training set')
+parser.add_argument('--mask_half_width', type=float, default=2.5, help='Half-width in degrees of each masked azimuth band (default 2.5 → 5° bands)')
+parser.add_argument('--no_xyz',          action='store_true',     help='Exclude XYZ position from the condition vector (ablation)')
 args = parser.parse_args()
 COND_DIM = 6 if args.no_xyz else 9
+MASKED_BANDS_DEG = _masked_bands(args.mask_half_width)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 with open("/data/beegfs/home/driouech/darcy/IQ_Diffusion/DiffWave/config/config.yaml", "r") as f:
@@ -66,7 +68,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=cfg['learning_rate'])
 from UniversalDataLoader import UniversalDataset
 dataset_train = UniversalDataset(task_id=132, mode="train", angle_mode='sincos')
 if args.mask_az_bands:
-    dataset_train = _filter_masked_bands(dataset_train)
+    dataset_train = _filter_masked_bands(dataset_train, MASKED_BANDS_DEG)
 dataloader_train = DataLoader(dataset_train, batch_size=cfg['batch_size'], shuffle=True, num_workers=0)
 dataset_test = UniversalDataset(task_id=132, mode="test", angle_mode='sincos')
 dataloader_test = DataLoader(dataset_test, batch_size=cfg['batch_size'], shuffle=False, num_workers=0)
@@ -224,6 +226,7 @@ with mlflow.start_run():
         'log_dir': args.log_dir,
         'output_dir': args.output_dir,
         'mask_az_bands': args.mask_az_bands,
+        'mask_half_width': args.mask_half_width,
     })
     for i in range(cfg['epochs']):
         train_loss = training_epoch(model, dataloader_train, optimizer, i)
